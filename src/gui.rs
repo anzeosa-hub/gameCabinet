@@ -34,36 +34,127 @@ pub struct HeroMsg {
 
 const STATUSES: [&str; 5] = ["未开始", "在玩", "已通关", "弃坑", "想玩"];
 
-// ---- 玻璃设计令牌（Apple 风：SF 蓝 + 冷灰夜色） ----
-// from_rgba_unmultiplied 非 const，这里用函数而非常量
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+/// 当前主题：true=夜色（默认），false=日间。设计令牌函数都读它。
+static THEME_DARK: AtomicBool = AtomicBool::new(true);
+fn is_dark() -> bool {
+    THEME_DARK.load(Ordering::Relaxed)
+}
+
+// ---- 动效基础设施 ----
+// 设计令牌（颜色/填充）本身不知道「当前这块内容淡入到几成」，所以走一个渲染期全局量：
+// 默认 1.0（不透明）；详情切换 / 空态入场时把它调低，令牌函数自动带上这个 alpha，
+// 整块内容就整体淡入 —— 不用给每个控件单独穿一个 alpha 参数。
+// AtomicF32 尚未稳定，用 AtomicU32 存 f32 位模式。
+static UI_ALPHA: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0f32.to_bits()
+fn ui_alpha() -> f32 {
+    f32::from_bits(UI_ALPHA.load(Ordering::Relaxed))
+}
+/// 设置全局内容透明度（0=全透，1=不透明）。用完必须还原成 1.0，
+/// 否则会影响同一帧后续绘制（比如弹层、状态栏）。
+fn set_ui_alpha(a: f32) {
+    UI_ALPHA.store(a.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+/// 按系数缩放颜色 alpha（局部动画用：列表错峰入场等）
+fn fa(c: egui::Color32, k: f32) -> egui::Color32 {
+    let a = (c.a() as f32 * k.clamp(0.0, 1.0)) as u8;
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+/// 全局内容透明度的应用：令牌函数统一用它包一层
+fn ua(c: egui::Color32) -> egui::Color32 {
+    fa(c, ui_alpha())
+}
+/// 缓动：smoothstep（两端慢中间快）。所有入场位移/淡入统一用它，
+/// 避免线性动画那种「机器感」。
+fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+/// 两个颜色的线性插值（逐通道）。滑块、卡片 hover 底色都用它做补间。
+fn mixc(c0: egui::Color32, c1: egui::Color32, k: f32) -> egui::Color32 {
+    let k = k.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k) as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        f(c0.r(), c1.r()),
+        f(c0.g(), c1.g()),
+        f(c0.b(), c1.b()),
+        f(c0.a(), c1.a()),
+    )
+}
+
+// ---- 玻璃设计令牌（Apple 风：SF 蓝 + 冷灰夜色 / 日间清玻璃） ----
+// from_rgba_unmultiplied 非 const，这里用函数而非常量；全部随主题切换
 fn glass_fill() -> egui::Color32 {
-    // 卡片底：低不透明度深色（透出亚克力模糊层，玻璃感优先；文字可读性由系统暗色 tint 兜底）
-    egui::Color32::from_rgba_unmultiplied(20, 24, 34, 70)
+    // 卡片底：低不透明度（透出亚克力模糊层，玻璃感优先）
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(20, 24, 34, 70))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 64))
+    }
 }
 fn glass_fill_hover() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(42, 48, 62, 150)
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(42, 48, 62, 150))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(248, 250, 255, 190))
+    }
 }
 fn glass_stroke() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+    // 描边：夜色用白（受光边），日间用深蓝灰
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(30, 42, 80, 38))
+    }
 }
 fn text_sub() -> egui::Color32 {
-    // 次要文字：保持较高不透明度，透在亮壁纸上也要可读（对比度规范）
-    egui::Color32::from_rgba_unmultiplied(226, 232, 246, 210)
+    // 次要文字：保持较高不透明度，透在壁纸上也要可读（对比度规范）
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(226, 232, 246, 210))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(64, 74, 96, 225))
+    }
 }
-const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(240, 244, 252);
+fn text_main() -> egui::Color32 {
+    if is_dark() {
+        ua(egui::Color32::from_rgb(240, 244, 252))
+    } else {
+        ua(egui::Color32::from_rgb(26, 32, 46))
+    }
+}
 
-// 控件底色：必须自带足够不透明度的深色，否则亮壁纸透过来会把浅色字吞掉
+// 控件底色：必须自带足够不透明度，否则壁纸透过来会把字吞掉
 fn button_fill() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(34, 38, 50, 185)
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(34, 38, 50, 185))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 185))
+    }
 }
 fn button_fill_hover() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(54, 60, 78, 205)
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(54, 60, 78, 205))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(238, 243, 254, 228))
+    }
 }
 fn button_fill_active() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(22, 26, 36, 225)
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(22, 26, 36, 225))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(220, 228, 246, 240))
+    }
 }
 fn accent_fill() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(10, 132, 255, 240)
+    ua(egui::Color32::from_rgba_unmultiplied(10, 132, 255, 240))
+}
+/// 悬停浮起的浅色罩（夜色=白雾，日间=淡影）
+fn hover_veil() -> egui::Color32 {
+    if is_dark() {
+        ua(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28))
+    } else {
+        ua(egui::Color32::from_rgba_unmultiplied(20, 30, 60, 16))
+    }
 }
 
 /// 状态 → 颜色
@@ -86,11 +177,16 @@ fn glass_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(14.0))
 }
 
-/// 弹窗玻璃框：近不透明深色 + 大圆角 + 细描边 + 悬浮阴影
+/// 弹窗玻璃框：近不透明底 + 大圆角 + 细描边 + 悬浮阴影
 /// （默认 Window 框太浅，标题栏和正文对比度都不够，统一换成这张）
 fn dialog_frame() -> egui::Frame {
+    let fill = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(20, 22, 32, 242)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(250, 251, 255, 246)
+    };
     egui::Frame::none()
-        .fill(egui::Color32::from_rgba_unmultiplied(20, 22, 32, 242))
+        .fill(fill)
         .rounding(egui::Rounding::same(16.0))
         .stroke(egui::Stroke::new(1.0_f32, glass_stroke()))
         .shadow(egui::epaint::Shadow {
@@ -111,6 +207,275 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             .rounding(egui::Rounding::same(10.0))
             .min_size(egui::vec2(0.0, 30.0)),
     )
+}
+
+/// 自绘标题栏的窗口控制按钮：最小化('m') / 最大化切换('x') / 关闭('c')。
+/// 图标几何取自 Lucide（24 栅格、圆角、圆头描边），矢量绘制、任意尺寸清晰，
+/// 不再用系统字体的符号（缺字形会变豆腐块）。
+fn window_control_button(ui: &mut egui::Ui, ctx: &egui::Context, kind: char, maximized: bool) {
+    let size = egui::vec2(34.0, 30.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    // 悬停补间 t：底罩淡入（不是硬切），图标从 0.94 微放大到 1.0 —— 有「被托起」的手感
+    let t = ui
+        .ctx()
+        .animate_value_with_time(egui::Id::new(("wctl", kind)), if resp.hovered() { 1.0 } else { 0.0 }, 0.12);
+    let base_c = if is_dark() {
+        egui::Color32::from_rgb(222, 226, 234)
+    } else {
+        egui::Color32::from_rgb(58, 64, 80)
+    };
+    // 关闭键悬停：底罩渐红 + 图标渐白（红底上白字才够对比度）
+    let c = if kind == 'c' {
+        mixc(base_c, egui::Color32::from_rgb(255, 255, 255), t)
+    } else {
+        base_c
+    };
+    if t > 0.002 {
+        let tint = if kind == 'c' {
+            fa(egui::Color32::from_rgb(232, 76, 76), t * 0.94)
+        } else {
+            fa(hover_veil(), t)
+        };
+        ui.painter().rect_filled(rect, 7.0, tint);
+    }
+    let p = ui.painter();
+    let ctr = rect.center();
+    let box_px = 18.0; // 图标在 24 栅格下占 18px 见方
+    let sc = box_px / 24.0 * (0.94 + 0.06 * ease(t));
+    let pt = |x: f32, y: f32| egui::pos2(ctr.x + (x - 12.0) * sc, ctr.y + (y - 12.0) * sc);
+    let sw = 1.7_f32;
+    let stroke = egui::Stroke::new(sw, c);
+    let cap = sw / 2.0;
+    // Lucide 的线条是圆头（round cap），末端补圆点还原观感
+    let dot = |a: egui::Pos2| p.circle_filled(a, cap, c);
+    let draw_x = |p: &egui::Painter| {
+        p.line_segment([pt(18.0, 6.0), pt(6.0, 18.0)], stroke);
+        p.line_segment([pt(6.0, 6.0), pt(18.0, 18.0)], stroke);
+        for (x, y) in [(18.0, 6.0), (6.0, 18.0), (6.0, 6.0), (18.0, 18.0)] {
+            p.circle_filled(pt(x, y), cap, c);
+        }
+    };
+    match kind {
+        'm' => {
+            // 最小化：横线（Lucide minus）
+            let a = pt(5.0, 12.0);
+            let b = pt(19.0, 12.0);
+            p.line_segment([a, b], stroke);
+            dot(a);
+            dot(b);
+        }
+        'x' => {
+            if maximized {
+                // 还原：两个叠放的圆角方块（Lucide copy 风格）
+                let back = egui::Rect::from_two_pos(pt(9.0, 4.0), pt(20.0, 15.0));
+                let front = egui::Rect::from_two_pos(pt(4.0, 9.0), pt(15.0, 20.0));
+                p.rect_stroke(back, 2.0 * sc, stroke);
+                p.rect_stroke(front, 2.0 * sc, stroke);
+            } else {
+                // 最大化：单个圆角方块（Lucide square）
+                let r = egui::Rect::from_two_pos(pt(4.0, 4.0), pt(20.0, 20.0));
+                p.rect_stroke(r, 2.0 * sc, stroke);
+            }
+        }
+        'c' => draw_x(p),
+        _ => {}
+    }
+    if resp.clicked() {
+        match kind {
+            'm' => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            'x' => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
+            'c' => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => {}
+        }
+    }
+}
+
+/// 「库」按钮前的 2x2 网格图标（Lucide layout-grid 风格），矢量描边
+fn draw_lib_grid(p: &egui::Painter, rect: egui::Rect, c: egui::Color32) {
+    let sc = rect.width() / 24.0;
+    let pt = |x: f32, y: f32| egui::pos2(rect.left() + x * sc, rect.top() + y * sc);
+    let stroke = egui::Stroke::new(2.0_f32, c);
+    for (x, y) in [(3.0, 3.0), (14.0, 3.0), (3.0, 14.0), (14.0, 14.0)] {
+        let r = egui::Rect::from_two_pos(pt(x, y), pt(x + 7.0, y + 7.0));
+        p.rect_stroke(r, 2.0 * sc, stroke);
+    }
+}
+
+/// 太阳图标（Lucide sun：中心圆 + 8 道光芒），矢量
+fn draw_sun(p: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32) {
+    p.circle_filled(c, r * 0.52, col);
+    let s = egui::Stroke::new(1.3_f32, col);
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::TAU / 8.0;
+        let (dx, dy) = a.sin_cos();
+        p.line_segment(
+            [
+                egui::pos2(c.x + dx * r * 0.74, c.y + dy * r * 0.74),
+                egui::pos2(c.x + dx * r * 1.05, c.y + dy * r * 1.05),
+            ],
+            s,
+        );
+    }
+}
+
+/// 月亮图标（Lucide moon 的月牙）：外圆减去右上偏移的内圆，
+/// 两圆求交后采样两段弧拼成闭合多边形（Mesh 三角扇填充，半透明底上也不会穿帮）。
+fn draw_moon(p: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32) {
+    let dx = 0.62 * r;
+    let dy = -0.62 * r;
+    let c1 = egui::pos2(c.x + dx, c.y + dy);
+    let r1 = 0.85 * r;
+    let d = (dx * dx + dy * dy).sqrt();
+    let a = (d * d + r * r - r1 * r1) / (2.0 * d);
+    let h2 = r * r - a * a;
+    if h2 <= 0.0 {
+        p.circle_filled(c, r, col);
+        return;
+    }
+    let h = h2.sqrt();
+    let (ux, uy) = (dx / d, dy / d);
+    // 两交点
+    let pa = egui::pos2(c.x + a * ux - h * uy, c.y + a * uy + h * ux);
+    let pb = egui::pos2(c.x + a * ux + h * uy, c.y + a * uy - h * ux);
+    let ang = |o: egui::Pos2, q: egui::Pos2| (q.y - o.y).atan2(q.x - o.x);
+    let norm = |mut t: f32| {
+        while t < 0.0 {
+            t += std::f32::consts::TAU;
+        }
+        while t >= std::f32::consts::TAU {
+            t -= std::f32::consts::TAU;
+        }
+        t
+    };
+    // 外弧：从 pa 到 pb，走远离内圆的那一侧（经过方向 -u）
+    let far = ang(c, egui::pos2(c.x - ux, c.y - uy));
+    let a0 = ang(c, pa);
+    let a1 = ang(c, pb);
+    let ccw = norm(a1 - a0);
+    let sweep = if norm(far - a0) <= ccw { ccw } else { ccw - std::f32::consts::TAU };
+    let mut pts: Vec<egui::Pos2> = Vec::new();
+    let n = 20;
+    for i in 0..=n {
+        let t = a0 + sweep * (i as f32) / (n as f32);
+        pts.push(egui::pos2(c.x + r * t.cos(), c.y + r * t.sin()));
+    }
+    // 内弧：从 pb 回到 pa，走靠近外圆心的那一侧（经过方向 c1→c = -u）
+    let near = ang(c1, c);
+    let b0 = ang(c1, pb);
+    let b1 = ang(c1, pa);
+    let ccw2 = norm(b1 - b0);
+    let sweep2 = if norm(near - b0) <= ccw2 { ccw2 } else { ccw2 - std::f32::consts::TAU };
+    for i in 0..=n {
+        let t = b0 + sweep2 * (i as f32) / (n as f32);
+        pts.push(egui::pos2(c1.x + r1 * t.cos(), c1.y + r1 * t.sin()));
+    }
+    let mut mesh = egui::Mesh::default();
+    // 手动铺三角扇（egui 0.27 的 Mesh 没有 add_triangle_fan）
+    let base = mesh.vertices.len() as u32;
+    for &q in &pts {
+        mesh.colored_vertex(q, col);
+    }
+    for i in 1..pts.len() - 1 {
+        mesh.add_triangle(base, base + i as u32, base + i as u32 + 1);
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+/// 主题切换胶囊：日/夜两段式（iOS 分段控件风）。
+/// 返回 Some(是否切到夜色) 表示用户点了切换。
+fn theme_capsule(ui: &mut egui::Ui, dark: bool) -> Option<bool> {
+    let seg_w = 26.0_f32;
+    let h = 20.0_f32;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(seg_w * 2.0 + 4.0, h), egui::Sense::hover());
+    let p = ui.painter();
+    // 轨道：必须比卡片底更「实」一点（浅灰），白色滑块才浮得起来。
+    // 之前轨道直接用 button_fill()：日间是白 185，白色滑块叠上去等于隐形 —— 看起来根本不像开关。
+    let track = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(26, 36, 62, 28)
+    };
+    p.rect_filled(rect, h * 0.5, track);
+    p.rect_stroke(rect, h * 0.5, egui::Stroke::new(1.0_f32, glass_stroke()));
+    // 激活段指示器（圆角滑块）
+    let seg = |i: usize| {
+        egui::Rect::from_min_size(
+            rect.min + egui::vec2(2.0 + i as f32 * seg_w, 2.0),
+            egui::vec2(seg_w, h - 4.0),
+        )
+    };
+    // 滑块补间：t 从 0（日间）到 1（夜色）平滑过渡，滑动动效就靠它
+    let t = ui
+        .ctx()
+        .animate_value_with_time(ui.id().with("theme_knob"), if dark { 1.0 } else { 0.0 }, 0.16);
+    let a = seg(0);
+    let b = seg(1);
+    let knob_rect = egui::Rect::from_min_max(
+        egui::pos2(egui::lerp(a.min.x..=b.min.x, t), a.min.y),
+        egui::pos2(egui::lerp(a.max.x..=b.max.x, t), a.max.y),
+    );
+    // 滑块：日间=纯白 + 两层递减黑投影（浮起的手感，iOS 分段控件同款做法）；
+    // 夜间=微亮白。颜色随 t 连续插值，滑动过程中不会突变。
+    let knob_r = (h - 4.0) * 0.5;
+    let shadow_k = 1.0 - ease(t);
+    if shadow_k > 0.01 {
+        p.rect_filled(
+            knob_rect.translate(egui::vec2(0.0, 1.6)).expand2(egui::vec2(1.2, 1.2)),
+            knob_r,
+            egui::Color32::from_black_alpha((30.0 * shadow_k) as u8),
+        );
+        p.rect_filled(
+            knob_rect.translate(egui::vec2(0.0, 0.6)).expand2(egui::vec2(0.6, 0.6)),
+            knob_r,
+            egui::Color32::from_black_alpha((24.0 * shadow_k) as u8),
+        );
+    }
+    // 颜色插值走全局 mixc（Color32 逐通道线性混合）
+    let knob = mixc(
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255),
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42),
+        t,
+    );
+    p.rect_filled(knob_rect, knob_r, knob);
+    // 两段图标：左=太阳（日间），右=月亮（夜色）。
+    // 激活色用主题主色，未激活色必须是「真·浅灰」——用 text_sub 灰蓝太深，
+    // 和主色拉不开差距，看起来像两个都激活了。颜色随滑块 t 连续淡变。
+    let active_c = text_main();
+    let inactive_c = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(140, 150, 170, 120)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(172, 180, 196, 255)
+    };
+    for (i, is_sun) in [(0usize, true), (1usize, false)] {
+        let r = seg(i);
+        let c = r.center();
+        // t=0 日间：太阳亮月亮灰；t=1 夜色：反之
+        let col = if is_sun {
+            mixc(active_c, inactive_c, t)
+        } else {
+            mixc(inactive_c, active_c, t)
+        };
+        if is_sun {
+            draw_sun(p, c, 5.2, col);
+        } else {
+            draw_moon(p, c, 5.4, col);
+        }
+    }
+    // 命中：两段各自的透明交互面
+    let resp_sun = ui
+        .interact(seg(0), ui.id().with("theme_sun"), egui::Sense::click())
+        .clicked();
+    let resp_moon = ui
+        .interact(seg(1), ui.id().with("theme_moon"), egui::Sense::click())
+        .clicked();
+    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    if resp_sun {
+        Some(false) // 切到日间
+    } else if resp_moon {
+        Some(true) // 切到夜色
+    } else {
+        None
+    }
 }
 
 /// 状态胶囊：状态色淡底 + 同色描边 + 同色字（详情页只读展示用）
@@ -134,7 +499,12 @@ fn thin_progress(ui: &mut egui::Ui, progress: u8, color: egui::Color32) {
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 6.0), egui::Sense::hover());
     let p = ui.painter();
-    p.rect_filled(rect, 3.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
+    let track_c = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(20, 30, 60, 22)
+    };
+    p.rect_filled(rect, 3.0, track_c);
     let fw = rect.width() * progress.min(100) as f32 / 100.0;
     if fw > 1.0 {
         p.rect_filled(
@@ -390,36 +760,65 @@ fn display_name(g: &GameEntry) -> &str {
     &g.name
 }
 
-/// 应用玻璃主题
+/// 应用玻璃主题（随主题胶囊切换：夜色 / 日间）
 fn apply_theme(ctx: &egui::Context) {
-    // 必须从纯深色主题出发，不能克隆当前主题再改 dark_mode：
-    // egui 默认 Style 是浅色（各状态 weak_bg_fill 都是 230+ 的白灰），
+    // 必须从纯色主题出发，不能克隆当前主题再改 dark_mode：
     // dark_mode 只是个标志位，不会重算已固化的底色字段。
-    let mut v = egui::Visuals::dark();
-    // 全局兜底：任何没显式指定颜色的文字一律浅色，杜绝「浅底配浅字」
-    v.override_text_color = Some(TEXT_MAIN);
+    let mut v = if is_dark() {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    // 全局兜底：任何没显式指定颜色的文字走主题主色，杜绝「浅底配浅字」
+    v.override_text_color = Some(text_main());
     // 面板底：低不透明度，保持通透
-    v.panel_fill = egui::Color32::from_rgba_unmultiplied(14, 16, 24, 60);
-    v.window_fill = egui::Color32::from_rgba_unmultiplied(24, 26, 36, 200);
-    v.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(10, 12, 18, 130);
-    // 控件（按钮/下拉/输入框）：深色玻璃底 + 纯白字，绝不许浅底配浅字
-    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8);
+    v.panel_fill = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(14, 16, 24, 60)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 44)
+    };
+    v.window_fill = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(24, 26, 36, 200)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(252, 253, 255, 235)
+    };
+    v.extreme_bg_color = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(10, 12, 18, 130)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(238, 242, 252, 110)
+    };
+    // 控件（按钮/下拉/输入框）：玻璃底 + 主题字色，绝不许浅底配浅字
+    v.widgets.noninteractive.bg_fill = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(20, 30, 60, 8)
+    };
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_sub());
     // 分隔线（面板拖拽分隔条 / ui.separator）走 bg_stroke：默认的灰白太抢眼，
-    // 会把「整窗一张连贯背景」硬生生切成左右两块，改成极淡的白
-    v.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
+    // 会把「整窗一张连贯背景」硬生生切成左右两块，改成极淡的主题色
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(
+        1.0_f32,
+        if is_dark() {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(20, 30, 60, 28)
+        },
+    );
     v.widgets.inactive.bg_fill = button_fill();
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.4_f32, egui::Color32::WHITE);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.4_f32, text_main());
     v.widgets.hovered.bg_fill = button_fill_hover();
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.4_f32, egui::Color32::WHITE);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.4_f32, text_main());
     v.widgets.active.bg_fill = button_fill_active();
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.4_f32, egui::Color32::WHITE);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.4_f32, text_main());
     v.widgets.open.bg_fill = button_fill();
-    v.widgets.open.fg_stroke = egui::Stroke::new(1.4_f32, egui::Color32::WHITE);
+    v.widgets.open.fg_stroke = egui::Stroke::new(1.4_f32, text_main());
     // 关键：Button / ComboBox / 弹窗标题栏的默认底色走的是 weak_bg_fill，不是 bg_fill。
-    // 只改 bg_fill 的话，这些控件会保留浅色主题的白灰底（230/248），配白字直接吞掉。
-    v.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10);
+    // 只改 bg_fill 的话，这些控件会保留 egui 默认主题的白灰/深灰底，配字直接吞掉。
+    v.widgets.noninteractive.weak_bg_fill = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80)
+    };
     v.widgets.inactive.weak_bg_fill = button_fill();
     v.widgets.hovered.weak_bg_fill = button_fill_hover();
     v.widgets.active.weak_bg_fill = button_fill_active();
@@ -477,6 +876,18 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     eprintln!("未找到系统中文字体，界面中文可能显示异常");
 }
 
+/// 内嵌的应用图标（assets/icon.png，编译期打包进二进制）
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+/// 解码应用图标为窗口图标数据（任务栏 / alt-tab 用）
+fn app_icon_raw() -> egui::IconData {
+    let img = image::load_from_memory(APP_ICON_PNG)
+        .expect("内置应用图标解码失败")
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    egui::IconData { width: w, height: h, rgba: img.into_raw() }
+}
+
 pub fn run() -> anyhow::Result<()> {
     // 临时调试：GAME_CABINET_WIN=780x560 以指定逻辑尺寸启动（验证小窗口布局用）
     let mut inner = egui::vec2(1080.0_f32, 740.0_f32);
@@ -493,7 +904,13 @@ pub fn run() -> anyhow::Result<()> {
             .with_inner_size(inner)
             .with_min_inner_size(egui::vec2(560.0_f32, 420.0_f32))
             // 窗口真透明：系统亚克力模糊透出桌面（配合 window-vibrancy）
-            .with_transparent(true),
+            .with_transparent(true)
+            // 去掉系统原生标题栏：改由 egui 自绘玻璃顶栏（拖拽 + 最小/最大/关闭）
+            .with_decorations(false)
+            // 允许缩放（最大化/还原；无边框下系统不提供边缘拖拽手柄，靠最大化按钮和本机快捷键）
+            .with_resizable(true)
+            // 任务栏 / 窗口图标（alt-tab、任务栏都显示它）
+            .with_icon(app_icon_raw()),
         ..Default::default()
     };
     eframe::run_native(
@@ -520,6 +937,12 @@ struct CabinetApp {
     scan_rx: Option<Receiver<ScanMsg>>,
     rematch_rx: Option<Receiver<RematchMsg>>,
     vibrancy_done: bool,
+    /// 主题：true=夜色（默认），false=日间（顶栏胶囊切换）
+    dark: bool,
+    /// 顶栏左上角的应用图标纹理（首次用到时从内嵌 PNG 懒加载）
+    icon_tex: Option<egui::TextureHandle>,
+    /// 窗口是否处于最大化态（自绘标题栏的还原/最大化按钮用，自己跟踪避免依赖平台 API）
+    maximized: bool,
     /// L1 整窗氛围底：横版英雄图强模糊 + 顶部径向遮罩
     bg_wide: Option<egui::TextureHandle>,
     /// L2 详情主视觉：同一张图轻模糊 + 柔和径向遮罩（比 L1 明显清晰）
@@ -551,6 +974,19 @@ struct CabinetApp {
     rename_buf: String,
     alias_idx: Option<usize>,
     alias_buf: String,
+    // ---- 动效计时器（秒；全部是「一次性入场」用的一次性进度）----
+    /// 详情内容入场进度 0→1（切换游戏时重置，配合背景交叉淡入）
+    detail_t: f32,
+    /// 上一帧的选中项：用来检测「切换了游戏」以重置入场进度
+    detail_key: Option<usize>,
+    /// 列表错峰入场计时（列表首次出现 / 扫描结束后重新计时）
+    list_t: f32,
+    /// 空状态欢迎卡入场进度
+    intro_t: f32,
+    /// 扫描完成提示的剩余时长（>0 时展示对勾 + 文字，之后淡出）
+    scan_done_t: f32,
+    /// 「库」下拉菜单是否展开（自管理，为了能做补间展开动画）
+    lib_menu: bool,
 }
 
 impl Default for CabinetApp {
@@ -573,6 +1009,9 @@ impl Default for CabinetApp {
             scan_rx: None,
             rematch_rx: None,
             vibrancy_done: false,
+            dark: true,
+            icon_tex: None,
+            maximized: false,
             bg_wide: None,
             bg_detail: None,
             bg_src: None,
@@ -594,6 +1033,12 @@ impl Default for CabinetApp {
             rename_buf: String::new(),
             alias_idx: None,
             alias_buf: String::new(),
+            detail_t: 1.0,
+            detail_key: None,
+            list_t: 0.0,
+            intro_t: 0.0,
+            scan_done_t: 0.0,
+            lib_menu: false,
         }
     }
 }
@@ -989,18 +1434,24 @@ impl CabinetApp {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, (a * 255.0) as u8),
             );
         }
-        // BorderDarken：整体压暗保证面板文字对比度。比上一版轻得多 —— 上一版 alpha 152~216
-        // 直接把画面压成黑灰，只剩详情区那块没被压到的图显得突兀，硬生生切出一条卡片边界
-        vgradient(
-            &p,
-            screen,
-            egui::Color32::from_rgba_unmultiplied(10, 12, 22, 92),
-            egui::Color32::from_rgba_unmultiplied(6, 8, 16, 168),
-        );
+        // BorderDarken：整体压暗/提亮保证面板文字对比度。夜色压暗，日间罩一层浅雾。
+        let (d0, d1) = if is_dark() {
+            (
+                egui::Color32::from_rgba_unmultiplied(10, 12, 22, 92),
+                egui::Color32::from_rgba_unmultiplied(6, 8, 16, 168),
+            )
+        } else {
+            (
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 46),
+                egui::Color32::from_rgba_unmultiplied(244, 248, 255, 120),
+            )
+        };
+        vgradient(&p, screen, d0, d1);
     }
 
     /// 右侧详情区：自适应内容（宽屏左右双栏 / 窄屏上下堆叠）
-    fn detail_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, i: usize) {
+    /// enter = 入场进度 0→1（整块淡入 + 自下而上落定；封面另有 1.04→1.0 缩放）
+    fn detail_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, i: usize, enter: f32) {
         // 先取好只读数据，后面要 &mut self 处理按钮动作，不能跨借用
         let title = display_name(&self.games[i]).to_string();
         let raw_name = self.games[i].name.clone();
@@ -1024,7 +1475,8 @@ impl CabinetApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(top_indent);
+                // 入场位移：内容从下方 8px 处落定（和淡入同步，避免「凭空出现」）
+                ui.add_space(top_indent + (1.0 - enter) * 8.0);
                 let avail = ui.available_width();
                 let narrow = avail < 560.0;
 
@@ -1091,7 +1543,7 @@ impl CabinetApp {
                         tgal.clone(),
                         egui::Color32::from_black_alpha(110),
                     );
-                    tp.galley(tr_rect.min, tgal, TEXT_MAIN);
+                    tp.galley(tr_rect.min, tgal, text_main());
                     tr_resp.on_hover_text(&title);
 
                     left.add_space(4.0);
@@ -1124,15 +1576,20 @@ impl CabinetApp {
 
                 // 右列：封面（清晰、只加圆角与投影，不糊）
                 {
-                    let c_rect = egui::Rect::from_min_max(
+                    // 入场落定：封面从 1.04 缩回 1.0（与整块淡入同步）
+                    let c_raw = egui::Rect::from_min_max(
                         egui::pos2(head_rect.right() - cw, head_rect.bottom() - ch),
                         head_rect.max,
+                    );
+                    let c_rect = egui::Rect::from_center_size(
+                        c_raw.center(),
+                        c_raw.size() * (1.0 + 0.04 * (1.0 - enter)),
                     );
                     let p = ui.painter().clone();
                     p.add(egui::epaint::RectShape::filled(
                         c_rect.translate(egui::vec2(0.0, 8.0)).expand2(egui::vec2(6.0, 6.0)),
                         egui::Rounding::same(11.0),
-                        egui::Color32::from_black_alpha(90),
+                        ua(egui::Color32::from_black_alpha(90)),
                     ));
                     let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                     tex_round_rect(
@@ -1141,14 +1598,18 @@ impl CabinetApp {
                         &tex,
                         uv,
                         egui::Rounding::same(10.0),
-                        egui::Color32::WHITE,
+                        ua(egui::Color32::WHITE),
                     );
                     p.rect_stroke(
                         c_rect,
                         10.0,
                         egui::Stroke::new(
                             1.0_f32,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                            ua(if is_dark() {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(30, 42, 80, 45)
+                            }),
                         ),
                     );
                     if no_cover {
@@ -1261,7 +1722,7 @@ impl CabinetApp {
     ) {
         glass_frame().show(ui, |ui| {
             ui.set_min_width((w - 28.0).max(150.0));
-            ui.label(egui::RichText::new("游戏详情").size(14.0).strong().color(TEXT_MAIN));
+            ui.label(egui::RichText::new("游戏详情").size(14.0).strong().color(text_main()));
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(4.0);
@@ -1311,7 +1772,7 @@ impl CabinetApp {
             });
             prop_row(ui, "进度", |ui| {
                 let (t, c) = if s.progress > 0 {
-                    (format!("{} %", s.progress), TEXT_MAIN)
+                    (format!("{} %", s.progress), text_main())
                 } else {
                     ("—".to_string(), text_sub())
                 };
@@ -1333,7 +1794,7 @@ impl CabinetApp {
             });
             prop_row(ui, "时长", |ui| {
                 let (tt, tc) = if s.playtime > 0.0 {
-                    (format!("{} 小时", s.playtime), TEXT_MAIN)
+                    (format!("{} 小时", s.playtime), text_main())
                 } else {
                     ("未记录".to_string(), text_sub())
                 };
@@ -1355,7 +1816,7 @@ impl CabinetApp {
                             .map(|x| x.to_string_lossy().into_owned())
                             .unwrap_or_else(|| f.to_string());
                         ui.add(
-                            egui::Label::new(egui::RichText::new(name).color(TEXT_MAIN).size(13.0))
+                            egui::Label::new(egui::RichText::new(name).color(text_main()).size(13.0))
                                 .truncate(true),
                         )
                         .on_hover_text(f);
@@ -1385,7 +1846,7 @@ impl CabinetApp {
     fn notes_panel(&mut self, ui: &mut egui::Ui, w: f32, s: &InfoSnap) {
         glass_frame().show(ui, |ui| {
             ui.set_min_width((w - 28.0).max(150.0));
-            ui.label(egui::RichText::new("备注").size(14.0).strong().color(TEXT_MAIN));
+            ui.label(egui::RichText::new("备注").size(14.0).strong().color(text_main()));
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(6.0);
@@ -1403,7 +1864,7 @@ impl CabinetApp {
                         .size(13.0),
                 );
             } else {
-                ui.label(egui::RichText::new(&s.note).color(TEXT_MAIN).size(14.0));
+                ui.label(egui::RichText::new(&s.note).color(text_main()).size(14.0));
             }
             ui.add_space(10.0);
             ui.label(
@@ -1476,75 +1937,126 @@ fn game_card(
     ui: &mut egui::Ui,
     tex: &egui::TextureHandle,
     g: &GameEntry,
+    // 列表里的序号：给补间动画当稳定 id（名字会变、会重名，不能当 key）
+    idx: usize,
     is_sel: bool,
     // tint = 该游戏封面的平均色：用来做卡片自带的毛玻璃底，卡片透出自身封面的虚化色
     tint: egui::Color32,
+    // appear = 入场进度 0→1（列表错峰淡入 + 封面落定缩放共用）
+    appear: f32,
 ) -> egui::Response {
     let avail = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, 78.0), egui::Sense::click());
-    // 卡片底：选中 > hover > 默认
     let hovered = ui.rect_contains_pointer(rect);
-    let fill = if is_sel {
-        egui::Color32::from_rgba_unmultiplied(10, 132, 255, 46)
-    } else if hovered {
-        glass_fill_hover()
-    } else {
-        glass_fill()
-    };
+    // ---- 补间量（animate_value_with_time 自带缓出，且动画期间会自动请求重绘）----
+    let th = ui.ctx().animate_value_with_time(
+        egui::Id::new(("card_hov", idx)),
+        if hovered { 1.0 } else { 0.0 },
+        0.12,
+    );
+    let ts = ui.ctx().animate_value_with_time(
+        egui::Id::new(("card_sel", idx)),
+        if is_sel { 1.0 } else { 0.0 },
+        0.18,
+    );
+    let a = appear;
+    // 卡片底：默认 → hover 补间，选中再叠一层蓝（不是硬切）
+    let base = mixc(glass_fill(), glass_fill_hover(), ease(th));
+    let fill = mixc(base, egui::Color32::from_rgba_unmultiplied(10, 132, 255, 46), ease(ts));
     let p = ui.painter().clone();
-    p.rect_filled(rect, 12.0, fill);
+    p.rect_filled(rect, 12.0, fa(fill, a));
     // 封面虚化色叠加：卡片自带一层自身封面的毛玻璃底（选中/hover 时更明显）
-    let tint_a = if is_sel { 96 } else if hovered { 68 } else { 42 };
+    let tint_a = (42.0 + 26.0 * ease(th) + 28.0 * ease(ts)).min(110.0) as u8;
     p.rect_filled(
         rect,
         12.0,
-        egui::Color32::from_rgba_unmultiplied(
-            (tint.r() as f32 * 0.62) as u8,
-            (tint.g() as f32 * 0.62) as u8,
-            (tint.b() as f32 * 0.68) as u8,
-            tint_a,
+        fa(
+            egui::Color32::from_rgba_unmultiplied(
+                (tint.r() as f32 * 0.62) as u8,
+                (tint.g() as f32 * 0.62) as u8,
+                (tint.b() as f32 * 0.68) as u8,
+                tint_a,
+            ),
+            a,
         ),
     );
-    let stroke = if is_sel {
-        egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(120, 180, 255))
-    } else if hovered {
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45))
+    // 描边：默认 → hover → 选中，逐级补间；选中时线也稍微加粗
+    let hov_stroke = if is_dark() {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45)
     } else {
-        egui::Stroke::new(1.0_f32, glass_stroke())
+        egui::Color32::from_rgba_unmultiplied(30, 42, 80, 55)
     };
-    p.rect_stroke(rect, 12.0, stroke);
+    let stroke_c = mixc(
+        mixc(glass_stroke(), hov_stroke, ease(th)),
+        egui::Color32::from_rgb(120, 180, 255),
+        ease(ts),
+    );
+    p.rect_stroke(
+        rect,
+        12.0,
+        egui::Stroke::new(1.0 + 0.2 * ease(ts), fa(stroke_c, a)),
+    );
+    // 选中标记：左侧高亮条从 0 宽滑入（iOS 列表选中观感）
+    if ts > 0.01 {
+        let bh = rect.height() * 0.46;
+        let bar = egui::Rect::from_min_size(
+            pos2(rect.min.x + 2.5, rect.center().y - bh * 0.5),
+            egui::vec2(3.0 * ease(ts), bh),
+        );
+        p.rect_filled(
+            bar,
+            1.5,
+            fa(egui::Color32::from_rgb(90, 165, 255), a * ease(ts)),
+        );
+    }
 
     // 封面缩略：圆角 + 柔化投影（egui 的 RectShape 没有 blur_width，用两层递减 alpha 叠出软边）
     let pad = 10.0_f32;
-    let th = 58.0_f32;
+    let th_size = 58.0_f32;
     let sz = tex.size();
     let aspect = sz[1] as f32 / sz[0] as f32;
-    let tw = (th / aspect).min(62.0);
-    let img_rect = egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(tw, th));
+    let tw = (th_size / aspect).min(62.0);
+    // 悬停放大约 3%，同时入场时从 1.06 缩回 1.0（解码落定）
+    let grow = 0.03 * ease(th) + 0.06 * (1.0 - ease(a));
+    let base_rect =
+        egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(tw, th_size));
+    let img_rect = egui::Rect::from_center_size(base_rect.center(), base_rect.size() * (1.0 + grow));
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     p.add(egui::epaint::RectShape::filled(
         img_rect.translate(egui::vec2(0.0, 3.0)).expand2(egui::vec2(3.5, 3.5)),
         egui::Rounding::same(9.0),
-        egui::Color32::from_black_alpha(26),
+        fa(egui::Color32::from_black_alpha(26), a),
     ));
     p.add(egui::epaint::RectShape::filled(
         img_rect.translate(egui::vec2(0.0, 1.5)).expand2(egui::vec2(1.5, 1.5)),
         egui::Rounding::same(8.0),
-        egui::Color32::from_black_alpha(38),
+        fa(egui::Color32::from_black_alpha(38), a),
     ));
-    tex_round_rect(&p, img_rect, tex, uv, egui::Rounding::same(7.0), egui::Color32::WHITE);
+    // 封面本身按入场进度淡入（解码完成不再「啪」地跳出来）
+    tex_round_rect(&p, img_rect, tex, uv, egui::Rounding::same(7.0), fa(egui::Color32::WHITE, a));
     p.rect_stroke(
         img_rect,
         7.0,
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
+        egui::Stroke::new(
+            1.0_f32,
+            fa(
+                if is_dark() {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(30, 42, 80, 40)
+                },
+                a,
+            ),
+        ),
     );
 
     // 名字（显示名 = 别名 > 匹配名 > 原始名；按像素宽截断 + 省略号，全名靠 hover tooltip）
     let title = display_name(g).to_string();
     let tx = img_rect.right() + 12.0;
     let max_w = rect.right() - 12.0 - tx;
-    let name_gal = fit_galley(&p, &title, 15.0, TEXT_MAIN, max_w);
-    p.galley(pos2(tx, rect.top() + 11.0), name_gal, TEXT_MAIN);
+    let name_c = text_main();
+    let name_gal = fit_galley(&p, &title, 15.0, name_c, max_w);
+    p.galley(pos2(tx, rect.top() + 11.0), name_gal, fa(name_c, a));
 
     // 状态 + 进度 + 评分
     let mut meta = g.status.clone();
@@ -1554,18 +2066,24 @@ fn game_card(
     if g.rating > 0 {
         meta.push_str(&format!("　★{}", g.rating));
     }
-    let meta_gal = fit_galley(&p, &meta, 12.5, status_color(&g.status), max_w);
-    p.galley(pos2(tx, rect.top() + 33.0), meta_gal, status_color(&g.status));
+    let meta_c = status_color(&g.status);
+    let meta_gal = fit_galley(&p, &meta, 12.5, meta_c, max_w);
+    p.galley(pos2(tx, rect.top() + 33.0), meta_gal, fa(meta_c, a));
 
-    // 细进度条（玻璃感：白色轨道 + 状态色填充）
+    // 细进度条（玻璃感：白色轨道 + 状态色填充）；入场时填充条从左「长」出来
     if g.progress > 0 {
         let bar_y = rect.bottom() - 11.0;
         let track = egui::Rect::from_min_max(pos2(tx, bar_y), pos2(rect.right() - 12.0, bar_y + 3.0));
-        p.rect_filled(track, 1.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24));
-        let w = track.width() * g.progress as f32 / 100.0;
+        let track_c = if is_dark() {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(20, 30, 60, 20)
+        };
+        p.rect_filled(track, 1.5, fa(track_c, a));
+        let w = track.width() * g.progress as f32 / 100.0 * ease(a);
         if w > 1.0 {
             let fill_r = egui::Rect::from_min_max(track.min, pos2(track.min.x + w, track.max.y));
-            p.rect_filled(fill_r, 1.5, status_color(&g.status));
+            p.rect_filled(fill_r, 1.5, fa(status_color(&g.status), a));
         }
     }
     resp
@@ -1574,7 +2092,7 @@ fn game_card(
 /// Windows 亚克力模糊（真·系统级透明，透出桌面）：直接走 user32 的
 /// SetWindowCompositionAttribute（undocumented 但稳定，Tauri 的 window-vibrancy 同款实现）
 #[cfg(windows)]
-fn apply_windows_acrylic() {
+fn apply_windows_acrylic(dark: bool) {
     use std::os::windows::ffi::OsStrExt;
 
     #[repr(C)]
@@ -1614,8 +2132,13 @@ fn apply_windows_acrylic() {
             eprintln!("未找到主窗口句柄，跳过亚克力效果");
             return;
         }
-        // gradient_color 为 ABGR：深色底 + 中低 alpha，让桌面的虚化透上来但不至于把画面压死
-        let tint = (112u32 << 24) | (26 << 16) | (22 << 8) | 14;
+        // gradient_color 为 ABGR：主题色底 + 中低 alpha，让桌面的虚化透上来但不至于把画面压死
+        // 夜色=深蓝黑；日间=低不透明度冷白（纯白高 alpha 会把模糊层压成死白，玻璃感全无）
+        let tint = if dark {
+            (112u32 << 24) | (26 << 16) | (22 << 8) | 14
+        } else {
+            (48u32 << 24) | (255 << 16) | (246 << 8) | 240
+        };
         let mut policy = AccentPolicy {
             accent_state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
             accent_flags: ACCENT_FLAG_DRAW_ALL_LAYERS,
@@ -1644,6 +2167,37 @@ fn apply_windows_acrylic() {
     }
 }
 
+/// Win11 圆角窗口：系统圆角是画在原生边框上的，无边框窗口不再自动获得，
+/// 用 DWM 手动加回来（Win10 无此属性，调用失败静默忽略，窗口保持直角）。
+fn apply_window_rounding() {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    }
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const u32, size: u32) -> i32;
+    }
+
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: u32 = 2;
+
+    let title: Vec<u16> = std::ffi::OsStr::new("游戏柜 · game-cabinet")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd == 0 {
+            return;
+        }
+        let pref: u32 = DWMWCP_ROUND;
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, 4);
+    }
+}
+
 impl eframe::App for CabinetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 变了东西之后主动补几帧。egui 是反应式的（实测空闲 6 秒只渲染 6 帧），
@@ -1655,11 +2209,40 @@ impl eframe::App for CabinetApp {
             ctx.request_repaint();
         }
 
+        // ---- 动效计时器推进 ----
+        // 全是「一次性入场」进度，跑满就停（停掉后不再 request_repaint，不白烧 CPU）。
+        // egui 是反应式的：动画期间必须自己叫重绘，否则会停在半路。
+        let dt = ctx.input(|i| i.stable_dt).min(0.05);
+        if self.selected != self.detail_key {
+            // 换了游戏：详情内容从头入场（与背景交叉淡入同步）
+            self.detail_key = self.selected;
+            self.detail_t = 0.0;
+        }
+        if self.detail_t < 1.0 {
+            self.detail_t = (self.detail_t + dt / 0.26).min(1.0);
+            ctx.request_repaint();
+        }
+        if self.list_t < 1.6 {
+            self.list_t = (self.list_t + dt).min(1.6);
+            ctx.request_repaint();
+        }
+        if self.intro_t < 1.0 {
+            self.intro_t = (self.intro_t + dt / 0.30).min(1.0);
+            ctx.request_repaint();
+        }
+        if self.scan_done_t > 0.0 {
+            self.scan_done_t = (self.scan_done_t - dt / 1.2).max(0.0);
+            ctx.request_repaint();
+        }
+
         // 首帧：窗口已存在，应用系统亚克力模糊
         if !self.vibrancy_done {
             self.vibrancy_done = true;
             #[cfg(windows)]
-            apply_windows_acrylic();
+            {
+                apply_windows_acrylic(self.dark);
+                apply_window_rounding();
+            }
         }
 
         // 英雄图下载完成（或确认没有）：写回条目 → 重建背景 → 落盘
@@ -1709,6 +2292,9 @@ impl eframe::App for CabinetApp {
                     self.selected = None;
                     self.editing = false;
                     self.status = format!("扫描完成，共 {} 款", self.games.len());
+                    // 动效：列表重新错峰入场 + 顶部亮一下「扫描完成」对勾
+                    self.list_t = 0.0;
+                    self.scan_done_t = 1.0;
                     ctx.request_repaint();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -1774,46 +2360,312 @@ impl eframe::App for CabinetApp {
             }
         }
 
-        // 顶部工具栏：半透明深色玻璃条（保证按钮/路径文字可读，同时别把背景图挡死）
+        // 自绘玻璃顶栏 = 标题栏 + 工具栏合一（按 apple-design 准则重做）：
+        // · 材质分层级：顶栏是结构层 → 较重的半透明材质；按钮是交互层 → 轻/透明，不叠亮面
+        // · 层级靠「字重 + 字号 + 分组留白」表达，去掉分隔线这类硬边
+        // · 受光亮边：顶边一条更亮的细线模拟玻璃上缘反光；底缘用渐变淡出代替硬线
         egui::TopBottomPanel::top("top")
+            .exact_height(34.0) // 收窄：内容全走 child_ui，主 ui 量不到高度，必须显式定高
             .frame(
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(12, 14, 22, 172))
-                    .inner_margin(egui::Margin::symmetric(14.0, 9.0)),
+                    .fill(if is_dark() {
+                        egui::Color32::from_rgba_unmultiplied(13, 15, 24, 150)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(252, 252, 255, 116)
+                    })
+                    .inner_margin(egui::Margin::symmetric(14.0, 2.0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if primary_button(ui, "选择游戏文件夹").clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                            self.start_scan(dir);
-                        }
-                    }
-                    if ui.button("打开库").clicked() {
-                        if let Some(p) =
-                            rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file()
-                        {
-                            self.open_library(p);
-                        }
-                    }
-                    if ui.button("重新扫描").clicked() {
-                        if !self.library_dir.as_os_str().is_empty() {
-                            self.start_scan(self.library_dir.clone());
-                        }
-                    }
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("库：{}", self.library_path.display()))
-                            .color(text_sub())
-                            .size(12.5),
+                let full = ui.available_rect_before_wrap();
+                // 窗口控制按钮与窗口边缘保持呼吸间距（右 6px、上下 2px），不再贴死角落
+                let ctrl_w = 3.0 * 34.0 + 8.0; // 三个控制按钮 + 按钮间距
+                let ctrl_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.right() - ctrl_w - 6.0, full.top() + 2.0),
+                    egui::pos2(full.right() - 6.0, full.bottom() - 2.0),
+                );
+                let left_rect = egui::Rect::from_min_max(
+                    full.min,
+                    egui::pos2(full.right() - ctrl_w, full.bottom()),
+                );
+
+                // 整条顶栏空白区都是拖拽区：先铺一层不可见的拖拽/双击面，
+                // 之后 child_ui 里的按钮等控件画在其上层，点击命中仍优先给按钮。
+                let bar_resp = ui.allocate_rect(full, egui::Sense::click_and_drag());
+                if bar_resp.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if bar_resp.double_clicked() {
+                    self.maximized = !self.maximized;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
+                }
+
+                let mut left_ui =
+                    ui.child_ui(left_rect, egui::Layout::left_to_right(egui::Align::Center));
+
+                // ── 标题组：应用图标（拖拽移动窗口，双击切换最大化）──
+                let icon_resp = {
+                    let tex = self.icon_tex.get_or_insert_with(|| {
+                        let img = image::load_from_memory(APP_ICON_PNG)
+                            .expect("内置应用图标解码失败")
+                            .into_rgba8();
+                        let size = [img.width() as usize, img.height() as usize];
+                        left_ui.ctx().load_texture(
+                            "app-icon",
+                            egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                    let (ir, resp) =
+                        left_ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::drag());
+                    left_ui.painter().image(
+                        tex.id(),
+                        ir,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
                     );
-                    // 状态色：扫描中偏黄、完成偏绿
-                    let st_color = if self.scan_rx.is_some() {
-                        egui::Color32::from_rgb(230, 190, 90)
+                    resp
+                };
+                if icon_resp.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if icon_resp.double_clicked() {
+                    self.maximized = !self.maximized;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
+                }
+
+                // ── 操作组：单个「库」按钮，点击弹出下拉三项 ──
+                // 不用 egui 原生 menu_button —— 它是瞬弹的，做不了补间展开动画。
+                // 这里自绘按钮 + 自管理弹层（Area），入场做「淡入 + 自上方下滑 6px」。
+                left_ui.add_space(22.0);
+                {
+                    let (brect, bresp) =
+                        left_ui.allocate_exact_size(egui::vec2(56.0, 22.0), egui::Sense::click());
+                    // 按钮悬停补间（幽灵样式 → 浅色圆角底），展开期间保持高亮
+                    let bh = ctx.animate_value_with_time(
+                        egui::Id::new("lib_btn_hov"),
+                        if bresp.hovered() || self.lib_menu { 1.0 } else { 0.0 },
+                        0.12,
+                    );
+                    if bresp.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let bp = left_ui.painter();
+                    let bg = if self.lib_menu {
+                        if is_dark() {
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 46)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(20, 30, 60, 30)
+                        }
                     } else {
-                        egui::Color32::from_rgb(120, 200, 140)
+                        hover_veil()
                     };
-                    ui.colored_label(st_color, egui::RichText::new(&self.status).size(12.5));
-                });
+                    if bh > 0.002 {
+                        bp.rect_filled(brect, 7.0, fa(bg, bh));
+                    }
+                    let btxt = mixc(text_sub(), text_main(), bh);
+                    let ir = egui::Rect::from_min_size(
+                        brect.min + egui::vec2(8.0, 3.0),
+                        egui::vec2(16.0, 16.0),
+                    );
+                    draw_lib_grid(bp, ir, btxt);
+                    bp.text(
+                        egui::pos2(ir.right() + 6.0, brect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        "库",
+                        egui::FontId::proportional(14.0),
+                        btxt,
+                    );
+                    if bresp.clicked() {
+                        self.lib_menu = !self.lib_menu;
+                        ctx.request_repaint();
+                    }
+
+                    // ---- 自管理弹层：t_open 驱动淡入 + 下滑 ----
+                    let t_open = ctx.animate_value_with_time(
+                        egui::Id::new("lib_menu_t"),
+                        if self.lib_menu { 1.0 } else { 0.0 },
+                        0.18,
+                    );
+                    if t_open > 0.01 {
+                        let e = ease(t_open);
+                        let mut act: Option<u8> = None;
+                        let pos = egui::pos2(brect.left(), brect.bottom() + 8.0 - 8.0 * e);
+                        let area = egui::Area::new(egui::Id::new("lib_menu"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(pos)
+                            .show(ctx, |ui| {
+                                let panel_fill = if is_dark() {
+                                    egui::Color32::from_rgba_unmultiplied(28, 32, 44, 244)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(250, 251, 255, 246)
+                                };
+                                egui::Frame::none()
+                                    .fill(fa(panel_fill, e))
+                                    .rounding(egui::Rounding::same(12.0))
+                                    .stroke(egui::Stroke::new(1.0_f32, fa(glass_stroke(), e)))
+                                    // 弹层留白：上下 8、左右 8（原来只有 6，文字贴边显局促）
+                                    .inner_margin(egui::Margin::symmetric(8.0, 8.0))
+                                    .show(ui, |ui| {
+                                        // 自绘行，不依赖系统按钮：行高、左右内边距、行间距完全可控，
+                                        // 悬停底色也与弹层等宽（系统按钮会缩到文字宽，看着短一截）
+                                        const W: f32 = 200.0;
+                                        const ROW_H: f32 = 30.0;
+                                        const ROW_GAP: f32 = 4.0;
+                                        // 先固定整体宽度，避免逐行 allocate 时宽度抖动；
+                                        // item_spacing 收到 0（行间距由 ROW_GAP + 行高内边距控制，
+                                        // 默认的 10px 会叠上去让行距虚胖）
+                                        ui.set_min_width(W);
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, ROW_GAP);
+                                        let items: [&str; 3] =
+                                            ["选择游戏文件夹…", "打开库文件…", "重新扫描"];
+                                        for (i, label) in items.iter().enumerate() {
+                                            // 逐条错峰落下：第 n 行晚 0.18t 起步（菜单有「层层落下」的节奏）
+                                            let rt = ((t_open - i as f32 * 0.18) / 0.82)
+                                                .clamp(0.0, 1.0);
+                                            let re = ease(rt);
+                                            let (rrect, rresp) = ui.allocate_exact_size(
+                                                egui::vec2(W, ROW_H),
+                                                egui::Sense::click(),
+                                            );
+                                            // 悬停底色补间（每行独立 id）
+                                            let hv = ui.ctx().animate_value_with_time(
+                                                egui::Id::new(("menu_row_hov", i)),
+                                                if rresp.hovered() { 1.0 } else { 0.0 },
+                                                0.10,
+                                            );
+                                            if hv > 0.002 {
+                                                ui.painter().rect_filled(
+                                                    rrect,
+                                                    8.0,
+                                                    fa(hover_veil(), hv * re),
+                                                );
+                                            }
+                                            if rresp.hovered() {
+                                                ui.ctx().set_cursor_icon(
+                                                    egui::CursorIcon::PointingHand,
+                                                );
+                                            }
+                                            // 文字：左对齐、距弹层边 12px（比原来宽松）
+                                            ui.painter().text(
+                                                egui::pos2(rrect.left() + 12.0, rrect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                *label,
+                                                egui::FontId::proportional(13.5),
+                                                fa(text_main(), re),
+                                            );
+                                            if rresp.clicked() {
+                                                act = Some(i as u8);
+                                            }
+                                        }
+                                    });
+                            });
+                        // 点空白处收起（点按钮本身由上面的 toggle 处理）
+                        if self.lib_menu && !area.response.hovered() && !bresp.hovered() {
+                            let clicked = ctx.input(|i| i.pointer.any_click());
+                            if clicked {
+                                self.lib_menu = false;
+                                ctx.request_repaint();
+                            }
+                        }
+                        if let Some(k) = act {
+                            self.lib_menu = false;
+                            ctx.request_repaint();
+                            match k {
+                                0 => {
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        self.start_scan(dir);
+                                    }
+                                }
+                                1 => {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .add_filter("JSON", &["json"])
+                                        .pick_file()
+                                    {
+                                        self.open_library(p);
+                                    }
+                                }
+                                _ => {
+                                    if !self.library_dir.as_os_str().is_empty() {
+                                        self.start_scan(self.library_dir.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── 主题胶囊：日/夜切换 ──
+                left_ui.add_space(16.0);
+                if let Some(nd) = theme_capsule(&mut left_ui, self.dark) {
+                    if nd != self.dark {
+                        self.dark = nd;
+                        THEME_DARK.store(nd, Ordering::Relaxed);
+                        apply_theme(ctx);
+                        // 亚克力 tint 也跟着换：夜色深蓝黑 / 日间亮白
+                        #[cfg(windows)]
+                        apply_windows_acrylic(nd);
+                        ctx.request_repaint();
+                    }
+                }
+
+                // ── 信息组：状态圆点 + 文字（库路径不再展示，没有信息量）──
+                left_ui.add_space(18.0);
+                let st_color = if self.scan_rx.is_some() {
+                    egui::Color32::from_rgb(230, 190, 90)
+                } else {
+                    egui::Color32::from_rgb(120, 200, 140)
+                };
+                let (dot_rect, _) =
+                    left_ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                left_ui
+                    .painter()
+                    .circle_filled(dot_rect.center(), 3.0, st_color);
+                left_ui.add_space(5.0);
+                left_ui.label(
+                    egui::RichText::new(&self.status).color(text_sub()).size(12.0),
+                );
+
+                // ── 右侧窗口控制 ──
+                let mut ctrl_ui =
+                    ui.child_ui(ctrl_rect, egui::Layout::left_to_right(egui::Align::Center));
+                ctrl_ui.add_space(2.0);
+                window_control_button(&mut ctrl_ui, ctx, 'm', self.maximized);
+                ctrl_ui.add_space(2.0);
+                window_control_button(&mut ctrl_ui, ctx, 'x', self.maximized);
+                ctrl_ui.add_space(2.0);
+                window_control_button(&mut ctrl_ui, ctx, 'c', self.maximized);
+
+                // ── 玻璃受光细节：顶边亮线 + 底缘渐变淡出（替代硬分隔线）──
+                let screen = ctx.screen_rect();
+                let wide = ui.painter().with_clip_rect(screen);
+                let (fade_c, edge_c) = if is_dark() {
+                    (
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 66),
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgba_unmultiplied(20, 30, 60, 30),
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+                    )
+                };
+                wide.line_segment(
+                    [
+                        egui::pos2(screen.left(), screen.top() + 0.5),
+                        egui::pos2(screen.right(), screen.top() + 0.5),
+                    ],
+                    egui::Stroke::new(1.0_f32, edge_c),
+                );
+                let bar_bottom = full.bottom() + 2.0; // 补回 inner_margin 的下半
+                vgradient(
+                    &wide,
+                    egui::Rect::from_min_max(
+                        egui::pos2(screen.left(), bar_bottom),
+                        egui::pos2(screen.right(), bar_bottom + 12.0),
+                    ),
+                    fade_c,
+                    egui::Color32::TRANSPARENT,
+                );
             });
 
         // 左侧游戏列表：透明面板 + 左右内边距（卡片不贴窗口边缘）
@@ -1827,12 +2679,35 @@ impl eframe::App for CabinetApp {
             )
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.heading(egui::RichText::new("游戏列表").color(TEXT_MAIN));
-                // 扫描中显示 spinner（快转 spinner 让加载显得更快）
+                ui.heading(egui::RichText::new("游戏列表").color(text_main()));
+                // 扫描中显示 spinner（快转 spinner 让加载显得更快）；完成后对勾淡出
                 if self.scan_rx.is_some() {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(egui::RichText::new("扫描并抓取封面中…").color(text_sub()));
+                    });
+                } else if self.scan_done_t > 0.0 {
+                    // 完成提示：对勾 + 文字，随剩余时长整体淡出（1.2s 后自然消失）
+                    let k = ease(self.scan_done_t.min(1.0));
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(
+                            egui::vec2(14.0, 14.0),
+                            egui::Sense::hover(),
+                        );
+                        let p = ui.painter();
+                        let ok = egui::Color32::from_rgb(94, 200, 140);
+                        // 手绘对勾（Lucide check），两段圆头线
+                        let pt = |x: f32, y: f32| {
+                            pos2(r.left() + x / 14.0 * r.width(), r.top() + y / 14.0 * r.height())
+                        };
+                        let st = egui::Stroke::new(1.8_f32, fa(ok, k));
+                        p.line_segment([pt(2.0, 7.6), pt(5.6, 11.0)], st);
+                        p.line_segment([pt(5.6, 11.0), pt(12.0, 3.4)], st);
+                        ui.label(
+                            egui::RichText::new("扫描完成")
+                                .color(fa(text_sub(), k))
+                                .size(12.5),
+                        );
                     });
                 }
                 ui.add_space(2.0);
@@ -1854,8 +2729,17 @@ impl eframe::App for CabinetApp {
                             .avg
                             .get(&cover_key(&self.games[i]))
                             .copied()
-                            .unwrap_or_else(|| egui::Color32::from_rgb(58, 64, 82));
-                        let resp = game_card(ui, &tex, &self.games[i], is_sel, tint);
+                            .unwrap_or_else(|| {
+                                if is_dark() {
+                                    egui::Color32::from_rgb(58, 64, 82)
+                                } else {
+                                    egui::Color32::from_rgb(206, 213, 230)
+                                }
+                            });
+                        // 错峰入场：按序号给一点延迟（上限 0.5s，游戏多了也不会等太久）
+                        let delay = (i as f32 * 0.02).min(0.5);
+                        let appear = ease(((self.list_t - delay) / 0.25).clamp(0.0, 1.0));
+                        let resp = game_card(ui, &tex, &self.games[i], i, is_sel, tint, appear);
                         let clicked = resp.clicked();
                         // tooltip：显示名 + 原始名（不同时才展示，方便认出是哪个文件夹）
                         let shown = display_name(&self.games[i]).to_string();
@@ -1889,7 +2773,7 @@ impl eframe::App for CabinetApp {
                 });
                 if n == 0 {
                     ui.add_space(16.0);
-                    ui.label(egui::RichText::new("还没有游戏").color(TEXT_MAIN));
+                    ui.label(egui::RichText::new("还没有游戏").color(text_main()));
                     ui.label(
                         egui::RichText::new("点上方「选择游戏文件夹」开始扫描你的单机游戏。")
                             .color(text_sub())
@@ -1907,16 +2791,25 @@ impl eframe::App for CabinetApp {
             )
             .show(ctx, |ui| {
                 if let Some(i) = self.selected {
-                    self.detail_ui(ctx, ui, i);
+                    // 详情入场：整块内容按 detail_t 淡入（令牌函数自动吃全局透明度），
+                    // 内容同时自下而上落定 8px。用完必须还原成 1.0，
+                    // 否则同一帧后面画的弹层/状态栏会一起变淡。
+                    let de = ease(self.detail_t);
+                    set_ui_alpha(de);
+                    self.detail_ui(ctx, ui, i, de);
+                    set_ui_alpha(1.0);
                 } else {
-                    ui.add_space(20.0);
+                    // 空状态入场：欢迎卡淡入 + 从下方 10px 落定
+                    let ie = ease(self.intro_t);
+                    ui.add_space(20.0 + (1.0 - ie) * 10.0);
+                    set_ui_alpha(ie);
                     // 空状态：居中玻璃欢迎卡
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
                         ui.set_max_width(460.0_f32.min(ui.available_width()));
                         glass_frame().show(ui, |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(8.0);
-                                ui.label(egui::RichText::new("游戏柜").heading().color(TEXT_MAIN));
+                                ui.label(egui::RichText::new("游戏柜").heading().color(text_main()));
                                 ui.add_space(4.0);
                                 ui.label(
                                     egui::RichText::new(
@@ -1944,6 +2837,7 @@ impl eframe::App for CabinetApp {
                             });
                         });
                     });
+                    set_ui_alpha(1.0); // 还原全局透明度（弹层/状态栏不能被一起淡掉）
                 }
             });
 
