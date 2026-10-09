@@ -1,0 +1,10 @@
+/target
+
+# 运行时产物（游戏库数据，不进版本库）
+covers/
+library.json
+wall.html
+.test_games/
+
+# 本地 AI 工作记忆（项目私有笔记，不进版本库）
+.workbuddy/
