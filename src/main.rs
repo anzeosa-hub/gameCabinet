@@ -50,9 +50,6 @@ enum Commands {
         /// 扫描根目录（封面输出位置）
         #[arg(short, long)]
         root: Option<PathBuf>,
-        /// 状态：未开始 / 在玩 / 已通关 / 弃坑 / 想玩
-        #[arg(long)]
-        status: Option<String>,
         /// 进度 0-100
         #[arg(long)]
         progress: Option<u8>,
@@ -99,7 +96,6 @@ async fn main() -> anyhow::Result<()> {
             name,
             library,
             root,
-            status,
             progress,
             playtime,
             rating,
@@ -107,10 +103,7 @@ async fn main() -> anyhow::Result<()> {
             appid,
             cover,
         }) => {
-            run_edit(
-                name, library, root, status, progress, playtime, rating, note, appid, cover, &key,
-            )
-            .await?
+            run_edit(name, library, root, progress, playtime, rating, note, appid, cover, &key).await?
         }
         Some(Commands::Wall { library, out }) => run_wall(library.as_path(), out.as_path())?,
         Some(Commands::Gui) | None => gui::run()?,
@@ -145,8 +138,8 @@ pub async fn scan_and_fetch(
     key: &str,
 ) -> anyhow::Result<library::Library> {
     let mut games = scanner::scan(folder);
+    // 散落 exe 的兜底目录；只有真用得上（没有独立文件夹的游戏）才在任务里按需创建
     let covers_dir = covers.unwrap_or_else(|| folder.join("covers"));
-    std::fs::create_dir_all(&covers_dir)?;
 
     let client = reqwest::Client::builder()
         .user_agent("game-cabinet/0.1 (local game manager)")
@@ -158,9 +151,12 @@ pub async fn scan_and_fetch(
     for (idx, game) in games.iter().enumerate() {
         let sem = sem.clone();
         let client = client.clone();
-        let covers_dir = covers_dir.clone();
         let name = game.name.clone();
         let key = key.to_string();
+        // 每个游戏的图放哪：游戏文件夹内的 .cabinet（自包含，删游戏不留残留）；散落 exe 才回落 covers
+        let art_rel = library::art_dir(folder, game);
+        let in_cabinet = art_rel != Path::new("covers");
+        let art_abs = if in_cabinet { folder.join(&art_rel) } else { covers_dir.clone() };
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let cans = match steam::search_steam(&name, &client, 6).await {
@@ -191,9 +187,16 @@ pub async fn scan_and_fetch(
                         };
                     }
                 };
-                let base = cover_base(&c);
-                let cover_path = covers_dir.join(format!("{base}_cover.jpg"));
-                let header_path = covers_dir.join(format!("{base}_header.jpg"));
+                let _ = std::fs::create_dir_all(&art_abs);
+                let (cover_path, header_path) = if in_cabinet {
+                    (art_abs.join("cover.jpg"), art_abs.join("header.jpg"))
+                } else {
+                    let base = cover_base(&c);
+                    (
+                        art_abs.join(format!("{base}_cover.jpg")),
+                        art_abs.join(format!("{base}_header.jpg")),
+                    )
+                };
                 let mut ok = steam::download_cover(&client, &cover, &cover_path).await.is_ok();
                 if !ok {
                     ok = steam::download_cover(&client, &header, &cover_path).await.is_ok();
@@ -247,20 +250,31 @@ async fn run_scan(
         println!("[*] 扫描目录: {}", folder.display());
         let mut games = scanner::scan(&folder);
         println!("[*] 发现 {} 个游戏", games.len());
+        // 散落 exe 的兜底目录；只有真用得上才在循环里按需创建
         let covers_dir = covers.unwrap_or_else(|| folder.join("covers"));
-        std::fs::create_dir_all(&covers_dir)?;
         let client = reqwest::Client::builder()
             .user_agent("game-cabinet/0.1 (local game manager)")
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
         for g in games.iter_mut() {
             println!("\n=== «{}» ===", g.name);
+            // 每个游戏的图放哪：游戏文件夹内的 .cabinet；散落 exe 才回落 covers
+            let art_rel = library::art_dir(&folder, g);
+            let in_cabinet = art_rel != Path::new("covers");
+            let art_abs = if in_cabinet { folder.join(&art_rel) } else { covers_dir.clone() };
             match interactive_pick(&g.name, &client, key).await? {
                 Some(c) => {
                     let (cover, header) = steam::resolve_cover(c.source, c.id, key, &client).await?;
-                    let base = cover_base(&c);
-                    let cover_path = covers_dir.join(format!("{base}_cover.jpg"));
-                    let header_path = covers_dir.join(format!("{base}_header.jpg"));
+                    let _ = std::fs::create_dir_all(&art_abs);
+                    let (cover_path, header_path) = if in_cabinet {
+                        (art_abs.join("cover.jpg"), art_abs.join("header.jpg"))
+                    } else {
+                        let base = cover_base(&c);
+                        (
+                            art_abs.join(format!("{base}_cover.jpg")),
+                            art_abs.join(format!("{base}_header.jpg")),
+                        )
+                    };
                     let mut ok = steam::download_cover(&client, &cover, &cover_path).await.is_ok();
                     if !ok {
                         ok = steam::download_cover(&client, &header, &cover_path).await.is_ok();
@@ -359,8 +373,8 @@ async fn run_match(library_path: PathBuf, root: Option<PathBuf>, key: &str) -> a
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    // 散落 exe 的兜底目录；按需创建
     let covers_dir = folder.join("covers");
-    std::fs::create_dir_all(&covers_dir)?;
     let client = reqwest::Client::builder()
         .user_agent("game-cabinet/0.1 (local game manager)")
         .timeout(std::time::Duration::from_secs(15))
@@ -374,8 +388,16 @@ async fn run_match(library_path: PathBuf, root: Option<PathBuf>, key: &str) -> a
         println!("\n=== «{}»（当前未匹配封面）===", g.name);
         if let Some(c) = interactive_pick(&g.name, &client, key).await? {
             let (cover, header) = steam::resolve_cover(c.source, c.id, key, &client).await?;
-            let base = cover_base(&c);
-            let cover_path = covers_dir.join(format!("{base}_cover.jpg"));
+            let art_rel = library::art_dir(&folder, g);
+            let in_cabinet = art_rel != Path::new("covers");
+            let art_abs = if in_cabinet { folder.join(&art_rel) } else { covers_dir.clone() };
+            let _ = std::fs::create_dir_all(&art_abs);
+            let cover_path = if in_cabinet {
+                art_abs.join("cover.jpg")
+            } else {
+                let base = cover_base(&c);
+                art_abs.join(format!("{base}_cover.jpg"))
+            };
             let mut ok = steam::download_cover(&client, &cover, &cover_path).await.is_ok();
             if !ok {
                 ok = steam::download_cover(&client, &header, &cover_path).await.is_ok();
@@ -405,7 +427,6 @@ async fn run_edit(
     name: String,
     library_path: PathBuf,
     root: Option<PathBuf>,
-    status: Option<String>,
     progress: Option<u8>,
     playtime: Option<f32>,
     rating: Option<u8>,
@@ -424,8 +445,8 @@ async fn run_edit(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    // 散落 exe 的兜底目录；按需创建
     let covers_dir = folder.join("covers");
-    std::fs::create_dir_all(&covers_dir)?;
     let client = reqwest::Client::builder()
         .user_agent("game-cabinet/0.1 (local game manager)")
         .timeout(std::time::Duration::from_secs(15))
@@ -435,10 +456,11 @@ async fn run_edit(
         Some(g) => g,
         None => anyhow::bail!("未找到包含「{}」的游戏", name),
     };
+    // 这个游戏的图放哪（下面两个补封面的分支都要用）
+    let art_rel = library::art_dir(&folder, g);
+    let in_cabinet = art_rel != Path::new("covers");
+    let art_abs = if in_cabinet { folder.join(&art_rel) } else { covers_dir.clone() };
 
-    if let Some(v) = status {
-        g.status = v;
-    }
     if let Some(v) = progress {
         g.progress = v.min(100);
     }
@@ -455,7 +477,12 @@ async fn run_edit(
     if let Some(id) = appid {
         g.steam_appid = Some(id);
         let (cover_url, header_url) = steam::resolve_cover("steam", id, key, &client).await?;
-        let cover_path = covers_dir.join(format!("{id}_cover.jpg"));
+        let _ = std::fs::create_dir_all(&art_abs);
+        let cover_path = if in_cabinet {
+            art_abs.join("cover.jpg")
+        } else {
+            art_abs.join(format!("{id}_cover.jpg"))
+        };
         let _ = steam::download_cover(&client, &cover_url, &cover_path).await;
         g.cover_url = Some(cover_url);
         g.header_url = Some(header_url);
@@ -464,11 +491,16 @@ async fn run_edit(
     }
 
     if let Some(c) = cover {
-        let base = match g.steam_appid {
-            Some(id) => id.to_string(),
-            None => sanitize(&g.name),
+        let _ = std::fs::create_dir_all(&art_abs);
+        let dest = if in_cabinet {
+            art_abs.join("cover.jpg")
+        } else {
+            let base = match g.steam_appid {
+                Some(id) => id.to_string(),
+                None => sanitize(&g.name),
+            };
+            art_abs.join(format!("{base}_cover.jpg"))
         };
-        let dest = covers_dir.join(format!("{base}_cover.jpg"));
         let url_opt = if c.starts_with("http://") || c.starts_with("https://") {
             steam::download_cover(&client, &c, &dest).await?;
             Some(c.clone())
@@ -507,9 +539,6 @@ fn run_wall(library: &Path, out: &Path) -> anyhow::Result<()> {
             .or_else(|| g.cover_url.clone())
             .unwrap_or_default();
         let mut info = String::new();
-        if !g.status.is_empty() {
-            info.push_str(&format!("<span class='tag'>{}</span> ", g.status));
-        }
         if g.progress > 0 {
             info.push_str(&progress_bar(g.progress));
         }

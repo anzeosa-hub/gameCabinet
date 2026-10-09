@@ -32,8 +32,6 @@ pub struct HeroMsg {
     pub rel: String,
 }
 
-const STATUSES: [&str; 5] = ["未开始", "在玩", "已通关", "弃坑", "想玩"];
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// 当前主题：true=夜色（默认），false=日间。设计令牌函数都读它。
 static THEME_DARK: AtomicBool = AtomicBool::new(true);
@@ -157,17 +155,6 @@ fn hover_veil() -> egui::Color32 {
     }
 }
 
-/// 状态 → 颜色
-fn status_color(s: &str) -> egui::Color32 {
-    match s {
-        "在玩" => egui::Color32::from_rgb(80, 200, 120),
-        "已通关" => egui::Color32::from_rgb(90, 160, 240),
-        "弃坑" => egui::Color32::from_rgb(230, 110, 110),
-        "想玩" => egui::Color32::from_rgb(230, 190, 90),
-        _ => egui::Color32::from_gray(160),
-    }
-}
-
 /// 玻璃卡片 Frame：半透明白 + 圆角 + 细描边
 fn glass_frame() -> egui::Frame {
     egui::Frame::none()
@@ -207,6 +194,22 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             .rounding(egui::Rounding::same(10.0))
             .min_size(egui::vec2(0.0, 30.0)),
     )
+}
+
+/// 「运行中」按钮：游戏正开着时顶替「启动游戏」，绿色实心，点击强制关闭
+fn running_button(ui: &mut egui::Ui) -> egui::Response {
+    let c = if is_dark() {
+        egui::Color32::from_rgb(48, 178, 122)
+    } else {
+        egui::Color32::from_rgb(30, 152, 102)
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new("■ 运行中").color(egui::Color32::WHITE))
+            .fill(c)
+            .rounding(egui::Rounding::same(10.0))
+            .min_size(egui::vec2(0.0, 30.0)),
+    )
+    .on_hover_text("点击强制关闭游戏")
 }
 
 /// 自绘标题栏的窗口控制按钮：最小化('m') / 最大化切换('x') / 关闭('c')。
@@ -478,23 +481,7 @@ fn theme_capsule(ui: &mut egui::Ui, dark: bool) -> Option<bool> {
     }
 }
 
-/// 状态胶囊：状态色淡底 + 同色描边 + 同色字（详情页只读展示用）
-fn status_pill(ui: &mut egui::Ui, s: &str) {
-    let c = status_color(s);
-    egui::Frame::none()
-        .fill(egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 40))
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 140),
-        ))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(9.0, 2.0))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(s).size(12.5).color(c));
-        });
-}
-
-/// 细进度条（只读展示：白轨道 + 状态色填充），宽度吃满所在容器
+/// 细进度条（只读展示：白轨道 + 主色填充），宽度吃满所在容器
 fn thin_progress(ui: &mut egui::Ui, progress: u8, color: egui::Color32) {
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 6.0), egui::Sense::hover());
@@ -686,6 +673,8 @@ struct DetailAct {
     save: bool,
     cancel: bool,
     launch: bool,
+    /// 当前游戏正在运行，用户点了「运行中」按钮要求强制关闭
+    stop: bool,
     open_dir: bool,
 }
 
@@ -696,6 +685,7 @@ fn detail_action_buttons(
     editing: bool,
     has_exe: bool,
     has_dir: bool,
+    running: bool,
 ) -> DetailAct {
     let mut a = DetailAct::default();
 
@@ -719,17 +709,25 @@ fn detail_action_buttons(
         a.open_dir = true;
     }
 
-    // 编辑态下「保存」已经是主色按钮，启动就不再抢主色，避免两个蓝按钮打架
-    let mut launch_btn = if editing {
-        ui.button("▶ 启动游戏")
+    if running {
+        // 正在运行：按钮顶替成绿色「运行中」，点击强制关闭
+        if running_button(ui).clicked() {
+            a.stop = true;
+        }
     } else {
-        primary_button(ui, "▶ 启动游戏")
-    };
-    if !has_exe {
-        launch_btn = launch_btn.on_hover_text("该条目未记录可执行文件（可右键左侧卡片「重命名并重新匹配」）");
-    }
-    if launch_btn.clicked() {
-        a.launch = true;
+        // 编辑态下「保存」已经是主色按钮，启动就不再抢主色，避免两个蓝按钮打架
+        let mut launch_btn = if editing {
+            ui.button("▶ 启动游戏")
+        } else {
+            primary_button(ui, "▶ 启动游戏")
+        };
+        if !has_exe {
+            launch_btn = launch_btn
+                .on_hover_text("该条目未记录可执行文件（可右键左侧卡片「重命名并重新匹配」）");
+        }
+        if launch_btn.clicked() {
+            a.launch = true;
+        }
     }
 
     a
@@ -737,11 +735,32 @@ fn detail_action_buttons(
 
 /// 详情页只读展示用的数据快照（避免在闭包里同时持有 &self.games 与 &mut self.edit_*）
 struct InfoSnap {
-    status: String,
     progress: u8,
     rating: u8,
     playtime: f32,
+    /// 当前正在运行的会话已耗时（秒）；0 = 没在运行
+    running_secs: f32,
     note: String,
+}
+
+/// 时长的人话格式：库里存的是小时（f32），但「0.02 小时」没人看得懂
+fn fmt_playtime(hours: f32) -> String {
+    if hours <= 0.0 {
+        return "未记录".to_string();
+    }
+    let total_min = (hours * 60.0).round() as u64;
+    if total_min == 0 {
+        return "不足 1 分钟".to_string();
+    }
+    if total_min < 60 {
+        return format!("{total_min} 分钟");
+    }
+    let (h, m) = (total_min / 60, total_min % 60);
+    if m == 0 {
+        format!("{h} 小时")
+    } else {
+        format!("{h} 小时 {m} 分钟")
+    }
 }
 
 /// 显示名：别名 > Steam 匹配名 > 原始名
@@ -962,7 +981,6 @@ struct CabinetApp {
     /// 封面平均色缓存（列表卡片做毛玻璃底用）
     avg: std::collections::HashMap<String, egui::Color32>,
     // 编辑缓冲
-    edit_status: String,
     edit_progress: u8,
     edit_rating: u8,
     edit_playtime: String,
@@ -987,6 +1005,24 @@ struct CabinetApp {
     scan_done_t: f32,
     /// 「库」下拉菜单是否展开（自管理，为了能做补间展开动画）
     lib_menu: bool,
+    /// 正在运行的游戏会话（启动时记下子进程句柄与起始时刻，退出时把时长累加进库）
+    running: Vec<RunningGame>,
+}
+
+/// 一次「启动游戏」会话。
+///
+/// 为什么要持着 `Child` 不放：只有留着句柄才能 `try_wait()` 知道它什么时候退出，
+/// 从而算出本次玩了多久。句柄本身不阻止进程运行，也不影响游戏。
+struct RunningGame {
+    /// 列表下标（仅作快速路径，定位仍以 `title` 为准，避免期间扫描/重排导致错位）
+    idx: usize,
+    /// 显示名：用来在条目里重新定位
+    title: String,
+    child: std::process::Child,
+    started: std::time::Instant,
+    /// 已经写进 library.json 的秒数。
+    /// 时长按分钟增量回写（而不是等退出才写一次），这样即使程序被强杀，最多只丢 1 分钟。
+    flushed_secs: f32,
 }
 
 impl Default for CabinetApp {
@@ -1023,7 +1059,6 @@ impl Default for CabinetApp {
             hero_rx: None,
             hero_tried: Default::default(),
             avg: Default::default(),
-            edit_status: "未开始".into(),
             edit_progress: 0,
             edit_rating: 0,
             edit_playtime: String::new(),
@@ -1039,6 +1074,7 @@ impl Default for CabinetApp {
             intro_t: 0.0,
             scan_done_t: 0.0,
             lib_menu: false,
+            running: Vec::new(),
         }
     }
 }
@@ -1047,7 +1083,6 @@ impl CabinetApp {
     /// 选中游戏时，把它的字段载入编辑缓冲
     fn load_edit_buffer(&mut self, i: usize) {
         if let Some(g) = self.games.get(i) {
-            self.edit_status = g.status.clone();
             self.edit_progress = g.progress;
             self.edit_rating = g.rating;
             self.edit_playtime = format!("{}", g.playtime_hours);
@@ -1059,7 +1094,6 @@ impl CabinetApp {
     fn save_selected(&mut self) {
         if let Some(i) = self.selected {
             if let Some(g) = self.games.get_mut(i) {
-                g.status = self.edit_status.clone();
                 g.progress = self.edit_progress;
                 g.rating = self.edit_rating;
                 g.playtime_hours = self.edit_playtime.trim().parse().unwrap_or(0.0);
@@ -1081,6 +1115,13 @@ impl CabinetApp {
             self.status = "名称为空，无法匹配".into();
             return;
         }
+        // 这个游戏的图放哪：自包含的游戏文件夹内 .cabinet；散落 exe 才回落 covers
+        let art_rel = self
+            .games
+            .get(idx)
+            .map(|g| crate::library::art_dir(&self.library_dir, g))
+            .unwrap_or_else(|| PathBuf::from("covers"));
+        let in_cabinet = art_rel != Path::new("covers");
         let dir = self.library_dir.clone();
         let key = std::env::var("STEAMGRIDDB_API_KEY").unwrap_or_default();
         let (tx, rx) = mpsc::channel();
@@ -1107,14 +1148,19 @@ impl CabinetApp {
                         .ok_or_else(|| anyhow::anyhow!("Steam 没搜到「{term}」，换个名字试试"))?;
                     let (cover, header) =
                         crate::steam::resolve_cover(c.source, c.id, &key, &client).await?;
-                    let covers_dir = dir.join("covers");
-                    std::fs::create_dir_all(&covers_dir)?;
-                    let base = if c.source == "sgdb" {
-                        format!("sgdb_{}", c.id)
+                    let out = if in_cabinet { dir.join(&art_rel) } else { dir.join("covers") };
+                    std::fs::create_dir_all(&out)?;
+                    let file_name = if in_cabinet {
+                        "cover.jpg".to_string()
                     } else {
-                        c.id.to_string()
+                        let base = if c.source == "sgdb" {
+                            format!("sgdb_{}", c.id)
+                        } else {
+                            c.id.to_string()
+                        };
+                        format!("{base}_cover.jpg")
                     };
-                    let cover_path = covers_dir.join(format!("{base}_cover.jpg"));
+                    let cover_path = out.join(&file_name);
                     let mut ok =
                         crate::steam::download_cover(&client, &cover, &cover_path).await.is_ok();
                     if !ok {
@@ -1127,8 +1173,13 @@ impl CabinetApp {
                         new_name: term.clone(),
                         appid: if c.source == "steam" { Some(c.id) } else { None },
                         matched: Some(c.name),
+                        // 无论图落在 .cabinet 还是 covers，都记「相对库根」的路径 ——
+                        // 加载端 library_dir.join(cover_local) 因此完全不用改
                         cover_local: if ok {
-                            Some(format!("covers/{base}_cover.jpg"))
+                            cover_path
+                                .strip_prefix(&dir)
+                                .ok()
+                                .map(|p| p.to_string_lossy().replace('\\', "/"))
                         } else {
                             None
                         },
@@ -1192,7 +1243,14 @@ impl CabinetApp {
     }
 
     /// 打开外部程序：工作目录设为 exe 所在文件夹（不少单机游戏靠相对路径读资源）
+    ///
+    /// 启动的同时记下会话：拿着子进程句柄，退出后自动把这局玩了多久累加进「时长」。
     fn launch_exe(&mut self, i: usize, title: &str) {
+        // 已在运行就别重复启动：多开一般不是本意，而且两个会话会重复计时
+        if self.running.iter().any(|r| r.title == title) {
+            self.status = format!("「{title}」已在运行中");
+            return;
+        }
         match self.games.get(i).and_then(|g| g.executable.clone()) {
             Some(exe) => {
                 let mut cmd = std::process::Command::new(&exe);
@@ -1200,13 +1258,123 @@ impl CabinetApp {
                     cmd.current_dir(dir);
                 }
                 match cmd.spawn() {
-                    Ok(_) => self.status = format!("已启动：{title}"),
+                    Ok(child) => {
+                        self.running.push(RunningGame {
+                            idx: i,
+                            title: title.to_string(),
+                            child,
+                            started: std::time::Instant::now(),
+                            flushed_secs: 0.0,
+                        });
+                        self.status = format!("已启动：{title}");
+                    }
                     Err(e) => self.status = format!("启动失败：{e}"),
                 }
             }
             None => {
                 self.status = "该条目没有可执行文件，右键左侧卡片「重命名并重新匹配」试试".into();
             }
+        }
+    }
+
+    /// 强制关闭正在运行的游戏（详情页「运行中」按钮），并立刻结算这一段时长
+    fn stop_game(&mut self, title: &str) {
+        if let Some(k) = self.running.iter().position(|r| r.title == title) {
+            let mut r = self.running.remove(k);
+            let _ = r.child.kill();
+            let _ = r.child.wait(); // 回收进程句柄，避免杀掉后留下悬挂的子进程
+            let elapsed = r.started.elapsed().as_secs_f32();
+            // 与自然退出保持一致：清掉「已启动」提示、整局不足 1 分钟不计入
+            self.status.clear();
+            if elapsed >= 60.0 {
+                let delta = elapsed - r.flushed_secs;
+                self.add_playtime(r.idx, &r.title, delta);
+            }
+        }
+    }
+
+    /// 轮询正在运行的游戏：① 按分钟增量回写时长 ② 进程退出时结算本次会话
+    ///
+    /// 为什么放主线程而不是开个线程去 `wait()`：`try_wait()` 是非阻塞的，一次几微秒；
+    /// 而结算要改 `self.games` 并落盘，放主线程省掉一整套跨线程同步。
+    fn poll_running(&mut self, ctx: &egui::Context) {
+        if self.running.is_empty() {
+            return;
+        }
+        // 运行期间保持低频刷新：时长显示要跟着走，但没必要每帧
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+
+        // ① 增量回写：每满 1 分钟把这一段写进库。
+        //    这样即使程序被强杀 / 直接关机，最多只丢 1 分钟，而不是整段归零。
+        //    （先在循环里收集，出了循环再写盘——循环持有 running 的可变借用，
+        //      里面不能同时借 self 调别的 &mut self 方法）
+        let mut pending: Vec<(usize, String, f32)> = Vec::new();
+        for r in self.running.iter_mut() {
+            let elapsed = r.started.elapsed().as_secs_f32();
+            if elapsed >= 60.0 && elapsed - r.flushed_secs >= 60.0 {
+                let delta = elapsed - r.flushed_secs;
+                r.flushed_secs = elapsed;
+                pending.push((r.idx, r.title.clone(), delta));
+            }
+        }
+        for (idx, title, delta) in pending {
+            self.add_playtime(idx, &title, delta);
+        }
+
+        // ② 找出已经退出的会话
+        let mut ended: Vec<usize> = Vec::new();
+        for (k, r) in self.running.iter_mut().enumerate() {
+            let exited = match r.child.try_wait() {
+                Ok(Some(_)) => true, // 正常退出
+                Err(_) => true,      // 句柄失效，当作已退出
+                Ok(None) => false,   // 还在跑
+            };
+            if exited {
+                ended.push(k);
+            }
+        }
+        for k in ended.into_iter().rev() {
+            let r = self.running.remove(k);
+            let elapsed = r.started.elapsed().as_secs_f32();
+            // 会话结束：清掉先前的「已启动」提示，免得顶栏留着一条过时信息
+            self.status.clear();
+            // 整局不足 1 分钟：多半是误点、或启动器拉起主程序后自身秒退，不记入，免得污染时长
+            if elapsed < 60.0 {
+                continue;
+            }
+            let delta = elapsed - r.flushed_secs;
+            self.add_playtime(r.idx, &r.title, delta);
+        }
+        ctx.request_repaint();
+    }
+
+    /// 把一段时长（秒）累加到某个游戏上并立即落盘。
+    ///
+    /// 定位策略：先看启动时记下的下标还对不对（名字也要对得上），不对再按显示名全库找。
+    /// 这样即使中途扫描过、列表重排过，也不会把时长加到别人头上。
+    fn add_playtime(&mut self, idx: usize, title: &str, secs: f32) {
+        if secs < 1.0 {
+            return;
+        }
+        let same = self
+            .games
+            .get(idx)
+            .map(|g| display_name(g) == title)
+            .unwrap_or(false);
+        let idx = if same {
+            idx
+        } else {
+            match self.games.iter().position(|g| display_name(g) == title) {
+                Some(i) => i,
+                None => return,
+            }
+        };
+        self.games[idx].playtime_hours += secs / 3600.0;
+        let lib = crate::library::Library {
+            games: self.games.clone(),
+        };
+        if let Err(e) = lib.save(&self.library_path) {
+            self.status = format!("时长保存失败：{e}");
         }
     }
 
@@ -1255,6 +1423,13 @@ impl CabinetApp {
             Some(v) => v,
             None => return,
         };
+        // 这个游戏的图放哪：自包含的游戏文件夹内 .cabinet；散落 exe 才回落 covers
+        let art_rel = self
+            .games
+            .get(i)
+            .map(|g| crate::library::art_dir(&self.library_dir, g))
+            .unwrap_or_else(|| PathBuf::from("covers"));
+        let in_cabinet = art_rel != Path::new("covers");
         self.hero_tried.insert(appid);
         let dir = self.library_dir.clone();
         let (tx, rx) = mpsc::channel();
@@ -1275,9 +1450,13 @@ impl CabinetApp {
                     .build()
                     .ok()?;
                 let url = crate::steam::resolve_hero(appid, &client).await?;
-                let covers = dir.join("covers");
-                std::fs::create_dir_all(&covers).ok()?;
-                let path = covers.join(format!("{appid}_hero.jpg"));
+                let out = if in_cabinet { dir.join(&art_rel) } else { dir.join("covers") };
+                std::fs::create_dir_all(&out).ok()?;
+                let path = out.join(if in_cabinet {
+                    "hero.jpg".to_string()
+                } else {
+                    format!("{appid}_hero.jpg")
+                });
                 crate::steam::download_cover(&client, &url, &path).await.ok()?;
                 // 没有这张图时 CDN 会甩一个很小的占位/HTML 过来，按体积筛掉
                 let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -1287,7 +1466,10 @@ impl CabinetApp {
                 }
                 Some(HeroMsg {
                     idx: i,
-                    rel: format!("covers/{appid}_hero.jpg"),
+                    rel: path
+                        .strip_prefix(&dir)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default(),
                 })
             });
             let _ = tx.send(res);
@@ -1316,10 +1498,18 @@ impl CabinetApp {
         }
         if let Some(c) = g.cover_local.as_deref() {
             let p = Path::new(c);
-            if let (Some(stem), Some(parent)) =
-                (p.file_stem().and_then(|s| s.to_str()), p.parent())
-            {
-                if let Some(base) = stem.strip_suffix("_cover") {
+            if let Some(parent) = p.parent() {
+                // 新格式：图放在游戏文件夹的 .cabinet 里，头图固定叫 header.jpg
+                let cand = parent.join("header.jpg");
+                if self.library_dir.join(&cand).exists() {
+                    return Some(cand.to_string_lossy().replace('\\', "/"));
+                }
+                // 旧格式：covers/ 下 {base}_header.jpg（老库照样认）
+                if let Some(base) = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.strip_suffix("_cover"))
+                {
                     let cand = parent.join(format!("{base}_header.jpg"));
                     if self.library_dir.join(&cand).exists() {
                         return Some(cand.to_string_lossy().replace('\\', "/"));
@@ -1455,7 +1645,8 @@ impl CabinetApp {
         // 先取好只读数据，后面要 &mut self 处理按钮动作，不能跨借用
         let title = display_name(&self.games[i]).to_string();
         let raw_name = self.games[i].name.clone();
-        let status = self.games[i].status.clone();
+        // 这个游戏是不是正开着（决定操作栏显示「启动游戏」还是「运行中」）
+        let is_running = self.running.iter().any(|r| r.title == title);
         let has_exe = self.games[i].executable.is_some();
         let has_dir = self.games[i].folder.is_some();
         let editing = self.editing;
@@ -1533,22 +1724,21 @@ impl CabinetApp {
                         egui::Sense::hover(),
                     );
                     let tp = left.painter().clone();
-                    tp.galley(
-                        tr_rect.min + egui::vec2(0.0, 2.0),
-                        tgal.clone(),
-                        egui::Color32::from_black_alpha(170),
-                    );
-                    tp.galley(
-                        tr_rect.min + egui::vec2(0.0, 1.0),
-                        tgal.clone(),
-                        egui::Color32::from_black_alpha(110),
-                    );
+                    // 大标题压在封面虚化底上要保可读性，但投影必须分主题：
+                    // 夜色 = 浅色字压深底 → 深色投影（偏移收到 1.6/0.8，只「垫」一下，不糊字形）
+                    // 日间 = 深色字压浅底 → 绝不能再叠黑投影：黑投影会把深字纵向撑高、笔画发毛，
+                    //        观感就是「字被拉长变形」；浅底本身够清晰，直接画字最干净
+                    if is_dark() {
+                        let sh_a = ua(egui::Color32::from_black_alpha(150));
+                        let sh_b = ua(egui::Color32::from_black_alpha(95));
+                        tp.galley(tr_rect.min + egui::vec2(0.0, 1.6), tgal.clone(), sh_a);
+                        tp.galley(tr_rect.min + egui::vec2(0.0, 0.8), tgal.clone(), sh_b);
+                    }
                     tp.galley(tr_rect.min, tgal, text_main());
                     tr_resp.on_hover_text(&title);
 
                     left.add_space(4.0);
                     left.horizontal(|ui| {
-                        status_pill(ui, &status);
                         if editing {
                             ui.label(
                                 egui::RichText::new("· 编辑中")
@@ -1570,7 +1760,7 @@ impl CabinetApp {
                     left.add_space(8.0);
                     // 必须包在 horizontal 里：left 是 top_down 布局，直接放按钮会一个按钮占一行
                     left.horizontal(|ui| {
-                        act = detail_action_buttons(ui, editing, has_exe, has_dir);
+                        act = detail_action_buttons(ui, editing, has_exe, has_dir, is_running);
                     });
                 }
 
@@ -1642,6 +1832,9 @@ impl CabinetApp {
                 if act.launch {
                     self.launch_exe(i, &title);
                 }
+                if act.stop {
+                    self.stop_game(&title);
+                }
                 if act.open_dir {
                     match self.games.get(i).and_then(|g| g.folder.clone()) {
                         Some(folder) => {
@@ -1654,11 +1847,18 @@ impl CabinetApp {
                 ui.add_space(14.0);
 
                 // ---- ③ 主体：左属性表 / 右备注（左栏固定宽、右栏取剩余）----
+                let cur_name = display_name(&self.games[i]).to_string();
                 let snap = InfoSnap {
-                    status: self.games[i].status.clone(),
                     progress: self.games[i].progress,
                     rating: self.games[i].rating,
                     playtime: self.games[i].playtime_hours,
+                    // 运行中的话，把「本次这一段」也算进去显示（还没到 1 分钟、尚未落盘的部分）
+                    running_secs: self
+                        .running
+                        .iter()
+                        .find(|r| r.title == cur_name)
+                        .map(|r| r.started.elapsed().as_secs_f32())
+                        .unwrap_or(0.0),
                     note: self.games[i].note.clone(),
                 };
                 let appid = self.games[i].steam_appid;
@@ -1727,16 +1927,6 @@ impl CabinetApp {
             ui.separator();
             ui.add_space(4.0);
             if self.editing {
-                prop_row(ui, "状态", |ui| {
-                    egui::ComboBox::from_id_source("edit_status")
-                        .selected_text(&self.edit_status)
-                        .width((w - 130.0).clamp(96.0, 160.0))
-                        .show_ui(ui, |ui| {
-                            for st in STATUSES {
-                                ui.selectable_value(&mut self.edit_status, st.to_string(), st);
-                            }
-                        });
-                });
                 prop_row(ui, "进度 %", |ui| {
                     ui.add(egui::Slider::new(&mut self.edit_progress, 0..=100));
                 });
@@ -1767,9 +1957,6 @@ impl CabinetApp {
                 let _ = i;
                 return;
             }
-            prop_row(ui, "状态", |ui| {
-                status_pill(ui, &s.status);
-            });
             prop_row(ui, "进度", |ui| {
                 let (t, c) = if s.progress > 0 {
                     (format!("{} %", s.progress), text_main())
@@ -1780,7 +1967,7 @@ impl CabinetApp {
                     ui.label(egui::RichText::new(t).color(c).size(13.5));
                     if s.progress > 0 {
                         ui.add_space(4.0);
-                        thin_progress(ui, s.progress, status_color(&s.status));
+                        thin_progress(ui, s.progress, accent_fill());
                     }
                 });
             });
@@ -1793,8 +1980,10 @@ impl CabinetApp {
                 ui.label(egui::RichText::new(rt).color(rc).size(13.5));
             });
             prop_row(ui, "时长", |ui| {
-                let (tt, tc) = if s.playtime > 0.0 {
-                    (format!("{} 小时", s.playtime), text_main())
+                // 运行中的这一段还没落盘，但显示上要立刻看得见（数字会一直走）
+                let total = s.playtime + s.running_secs / 3600.0;
+                let (tt, tc) = if total > 0.0 {
+                    (fmt_playtime(total), text_main())
                 } else {
                     ("未记录".to_string(), text_sub())
                 };
@@ -1944,6 +2133,8 @@ fn game_card(
     tint: egui::Color32,
     // appear = 入场进度 0→1（列表错峰淡入 + 封面落定缩放共用）
     appear: f32,
+    // running = 这个游戏正开着（从我们这里启动的），右上角点一颗绿点
+    running: bool,
 ) -> egui::Response {
     let avail = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, 78.0), egui::Sense::click());
@@ -2053,24 +2244,42 @@ fn game_card(
     // 名字（显示名 = 别名 > 匹配名 > 原始名；按像素宽截断 + 省略号，全名靠 hover tooltip）
     let title = display_name(g).to_string();
     let tx = img_rect.right() + 12.0;
-    let max_w = rect.right() - 12.0 - tx;
+    // 运行中的话右上角要留出绿点的位置，名字可用宽度相应收窄
+    let dot_w = if running { 22.0 } else { 0.0 };
+    let max_w = rect.right() - 12.0 - dot_w - tx;
     let name_c = text_main();
     let name_gal = fit_galley(&p, &title, 15.0, name_c, max_w);
     p.galley(pos2(tx, rect.top() + 11.0), name_gal, fa(name_c, a));
 
-    // 状态 + 进度 + 评分
-    let mut meta = g.status.clone();
+    // 运行中标记：一颗绿点（具体玩了多久在详情页的「时长」行里）
+    if running {
+        let rc = if is_dark() {
+            egui::Color32::from_rgb(96, 214, 156)
+        } else {
+            egui::Color32::from_rgb(20, 156, 104)
+        };
+        let c = pos2(rect.right() - 19.0, rect.top() + 16.0);
+        p.circle_filled(
+            c,
+            6.5,
+            fa(egui::Color32::from_rgba_unmultiplied(rc.r(), rc.g(), rc.b(), 62), a),
+        );
+        p.circle_filled(c, 3.6, fa(rc, a));
+    }
+
+    // 进度 + 评分
+    let mut meta = String::new();
     if g.progress > 0 {
         meta.push_str(&format!("　{}%", g.progress));
     }
     if g.rating > 0 {
         meta.push_str(&format!("　★{}", g.rating));
     }
-    let meta_c = status_color(&g.status);
+    let meta_c = text_sub();
     let meta_gal = fit_galley(&p, &meta, 12.5, meta_c, max_w);
     p.galley(pos2(tx, rect.top() + 33.0), meta_gal, fa(meta_c, a));
 
-    // 细进度条（玻璃感：白色轨道 + 状态色填充）；入场时填充条从左「长」出来
+    // 细进度条（玻璃感：白色轨道 + 主色填充）；入场时填充条从左「长」出来
     if g.progress > 0 {
         let bar_y = rect.bottom() - 11.0;
         let track = egui::Rect::from_min_max(pos2(tx, bar_y), pos2(rect.right() - 12.0, bar_y + 3.0));
@@ -2083,7 +2292,7 @@ fn game_card(
         let w = track.width() * g.progress as f32 / 100.0 * ease(a);
         if w > 1.0 {
             let fill_r = egui::Rect::from_min_max(track.min, pos2(track.min.x + w, track.max.y));
-            p.rect_filled(fill_r, 1.5, fa(status_color(&g.status), a));
+            p.rect_filled(fill_r, 1.5, fa(accent_fill(), a));
         }
     }
     resp
@@ -2234,6 +2443,9 @@ impl eframe::App for CabinetApp {
             self.scan_done_t = (self.scan_done_t - dt / 1.2).max(0.0);
             ctx.request_repaint();
         }
+
+        // ---- 运行中会话：推进计时 / 结算已退出的游戏 ----
+        self.poll_running(ctx);
 
         // 首帧：窗口已存在，应用系统亚克力模糊
         if !self.vibrancy_done {
@@ -2715,6 +2927,9 @@ impl eframe::App for CabinetApp {
                 let n = self.games.len();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space(2.0);
+                    // 正在计时的游戏名（按显示名比对，下标可能因扫描而变）
+                    let running_names: std::collections::HashSet<String> =
+                        self.running.iter().map(|r| r.title.clone()).collect();
                     for i in 0..n {
                         let tex = ensure_cover(
                             ctx,
@@ -2739,7 +2954,9 @@ impl eframe::App for CabinetApp {
                         // 错峰入场：按序号给一点延迟（上限 0.5s，游戏多了也不会等太久）
                         let delay = (i as f32 * 0.02).min(0.5);
                         let appear = ease(((self.list_t - delay) / 0.25).clamp(0.0, 1.0));
-                        let resp = game_card(ui, &tex, &self.games[i], i, is_sel, tint, appear);
+                        let is_running = running_names.contains(display_name(&self.games[i]));
+                        let resp =
+                            game_card(ui, &tex, &self.games[i], i, is_sel, tint, appear, is_running);
                         let clicked = resp.clicked();
                         // tooltip：显示名 + 原始名（不同时才展示，方便认出是哪个文件夹）
                         let shown = display_name(&self.games[i]).to_string();
@@ -2821,7 +3038,7 @@ impl eframe::App for CabinetApp {
                                 ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new(
-                                        "扫描会自动按游戏名从 Steam 抓取封面，下载到 <游戏目录>/covers。",
+                                        "扫描会自动按游戏名从 Steam 抓取封面，存进每个游戏文件夹下的 .cabinet。",
                                     )
                                     .color(text_sub())
                                     .size(12.5),

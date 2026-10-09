@@ -1,4 +1,32 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// 每个游戏专属的图片子目录名。
+/// 放在游戏文件夹内部，与游戏自身的文件分开存放，跟着游戏一起移动 / 删除。
+pub const CABINET_DIR: &str = ".cabinet";
+
+/// 该游戏的图片输出目录（相对库根的路径）。
+///
+/// - 游戏是库根下的**一级子文件夹** → `<游戏文件夹>/.cabinet`（自包含，删游戏不留残留）
+/// - 根目录下散落的 exe（`folder` 为空）→ 回落到 `covers`（没有独立文件夹可放）
+pub fn art_dir(root: &Path, g: &GameEntry) -> PathBuf {
+    if let Some(f) = g.folder.as_deref() {
+        // 注意：`folder` 由 scanner 按 `root.join(子目录名)` 生成，**本身就含 root 前缀**
+        //（绝对 root → 绝对路径；CLI 传相对 root → 相对 cwd 的路径）。
+        // 所以这里绝不能再 join(root)，否则会叠加成 `<root>/<root>/<游戏>`。
+        let fp = Path::new(f);
+        // 规范化后再比父目录：兼容 `D:\Games\` 与 `D:\Games`、尾斜杠等写法差异
+        let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let fp_c = std::fs::canonicalize(fp).unwrap_or_else(|_| fp.to_path_buf());
+        // 必须确实是库根的直接子目录，才敢往里写（嵌套目录 / 库根本身都排除）
+        if fp_c.is_dir() && fp_c.parent() == Some(root_c.as_path()) {
+            if let Some(name) = fp_c.file_name() {
+                return Path::new(name).join(CABINET_DIR);
+            }
+        }
+    }
+    PathBuf::from("covers")
+}
 
 /// 一个游戏的数据库条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,9 +54,6 @@ pub struct GameEntry {
     /// 详情页背景取宽幅美术图，铺满才好看；竖版封面拉大只会糊成一团。
     #[serde(default)]
     pub hero_local: Option<String>,
-    /// 游戏状态：未开始 / 在玩 / 已通关 / 弃坑 / 想玩
-    #[serde(default)]
-    pub status: String,
     /// 通关进度 0-100
     #[serde(default)]
     pub progress: u8,

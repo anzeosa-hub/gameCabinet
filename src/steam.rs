@@ -139,11 +139,30 @@ pub async fn resolve_cover(
 /// 下载封面字节到本地
 pub async fn download_cover(client: &reqwest::Client, url: &str, dest: &Path) -> anyhow::Result<()> {
     let bytes = client.get(url).send().await?.bytes().await?;
+    // CDN 对不存在的图会回一个很小的 HTML / 占位响应。若不加判断直接写盘，
+    // 就会留下一个无法解码的「假封面」（实测见过 146 字节的），列表里表现为破图，
+    // 而且因为文件确实存在、路径也记对了，排查起来很费劲。
+    if !looks_like_image(&bytes) {
+        anyhow::bail!("响应不是图片（{} 字节），已丢弃", bytes.len());
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(dest, &bytes)?;
     Ok(())
+}
+
+/// 按文件头魔数粗略判断是不是图片（JPEG / PNG / GIF / WEBP / BMP）。
+/// 比体积阈值可靠：能挡住 HTML 错误页，也不会误杀体积偏小的正常图。
+fn looks_like_image(b: &[u8]) -> bool {
+    if b.len() < 12 {
+        return false;
+    }
+    b.starts_with(&[0xFF, 0xD8, 0xFF]) // JPEG
+        || b.starts_with(&[0x89, 0x50, 0x4E, 0x47]) // PNG
+        || b.starts_with(b"GIF")
+        || (b.starts_with(b"RIFF") && b[8..12] == [0x57, 0x45, 0x42, 0x50]) // WEBP
+        || b.starts_with(b"BM") // BMP
 }
 
 /// 横版「英雄图」地址 —— 详情页背景图就取它（不是竖版封面）。
