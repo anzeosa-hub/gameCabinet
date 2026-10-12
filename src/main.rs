@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 mod gui;
 mod library;
+mod saves;
 mod scanner;
 mod steam;
 
@@ -69,6 +70,20 @@ enum Commands {
         #[arg(long)]
         cover: Option<String>,
     },
+    /// 探测游戏的存档位置（只读：不移动、不修改任何文件）
+    Probe {
+        /// 游戏库文件
+        #[arg(short, long, default_value = "library.json")]
+        library: PathBuf,
+        /// 只看名字含该关键词的游戏
+        filter: Option<String>,
+        /// 列出本机还不存在的路径（游戏没玩过、目录还没生成）
+        #[arg(long)]
+        all: bool,
+        /// 交互式确认：把选中的路径写进 library.json
+        #[arg(short, long)]
+        pick: bool,
+    },
     /// 根据 library.json 生成 HTML 海报墙（含进度 / 状态 / 评分）
     Wall {
         #[arg(short, long, default_value = "library.json")]
@@ -105,6 +120,12 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             run_edit(name, library, root, progress, playtime, rating, note, appid, cover, &key).await?
         }
+        Some(Commands::Probe {
+            library,
+            filter,
+            all,
+            pick,
+        }) => run_probe(library.as_path(), filter.as_deref(), all, pick)?,
         Some(Commands::Wall { library, out }) => run_wall(library.as_path(), out.as_path())?,
         Some(Commands::Gui) | None => gui::run()?,
     }
@@ -522,6 +543,148 @@ async fn run_edit(
     let updated_name = g.name.clone();
     lib.save(&lib_path)?;
     println!("[*] 已更新 «{}»", updated_name);
+    Ok(())
+}
+
+/// 探测每个游戏的存档位置。
+///
+/// 默认是**纯只读**的：只把本机真实存在的候选路径列出来给人看。
+/// 加 `--pick` 才进入交互模式，把人选中的路径写进 `library.json`。
+fn run_probe(
+    library_path: &Path,
+    filter: Option<&str>,
+    list_missing: bool,
+    pick: bool,
+) -> anyhow::Result<()> {
+    if !library_path.exists() {
+        anyhow::bail!(
+            "找不到游戏库文件：{}\n用 --library 指定 library.json 的路径",
+            library_path.display()
+        );
+    }
+    let mut lib = library::Library::load(library_path);
+    if lib.games.is_empty() {
+        anyhow::bail!("游戏库是空的（或 JSON 解析失败），先跑一次 scan");
+    }
+
+    let mut total = 0usize;
+    let mut none = 0usize;
+    for g in lib.games.iter_mut() {
+        if let Some(f) = filter {
+            if !g.name.to_lowercase().contains(&f.to_lowercase()) {
+                continue;
+            }
+        }
+        let folder = g.folder.clone().map(PathBuf::from);
+        let exe_p = g.executable.clone().map(PathBuf::from);
+        let res = saves::probe_game(folder.as_deref(), exe_p.as_deref(), &g.name);
+        let shown: Vec<(usize, &saves::Candidate)> = res
+            .candidates
+            .iter()
+            .enumerate()
+            // 默认只显示本机真实存在的；但「引擎声明」类的路径即使还不存在也要显示出来 ——
+            // 它告诉你游戏将来会把存档写到哪（只是还没玩过、目录没生成），比空手而归有用
+            .filter(|(_, c)| {
+                list_missing
+                    || c.exists
+                    || matches!(c.origin, saves::Origin::Declared)
+            })
+            .collect();
+
+        println!("\n=== «{}» ===", g.name);
+        match &res.engine {
+            Some(e) => {
+                println!("  引擎: {e}");
+                for (k, v) in &res.params {
+                    println!("       {k} = {v}");
+                }
+            }
+            None => println!("  引擎: 未识别"),
+        }
+        if shown.is_empty() {
+            none += 1;
+            println!("  本机没有任何存在的候选路径，也没有能读出路径的引擎声明。");
+            println!("  要么还没玩过、引擎也没留下线索；要么得你自己翻一次文件夹再手填。");
+            continue;
+        }
+        if shown.iter().all(|(_, c)| !c.exists) {
+            none += 1;
+        }
+        total += shown.len();
+        for (n, c) in shown.iter() {
+            if c.exists {
+                println!(
+                    "  [{}] {} · {} · {} 文件 · 最近 {}\n      {}\n      {}",
+                    n + 1,
+                    c.origin.label(),
+                    saves::fmt_bytes(c.bytes),
+                    c.files,
+                    saves::fmt_modified(c.modified),
+                    c.path.display(),
+                    c.why,
+                );
+            } else {
+                println!(
+                    "  [{}] {} · （本机不存在）\n      {}\n      {}",
+                    n + 1,
+                    c.origin.label(),
+                    c.path.display(),
+                    c.why,
+                );
+            }
+        }
+
+        if pick {
+            print!("  选择（序号，逗号分隔；也可直接粘贴一个路径；回车跳过）> ");
+            io::stdout().flush()?;
+            let mut line = String::new();
+            io::stdin().lock().read_line(&mut line)?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // 输入里含盘符或反斜杠就当成手填路径，否则按「一组序号」解析
+            let looks_path = line.contains(':') || line.contains('\\') || line.contains('/');
+            let mut chosen: Vec<saves::SaveSpec> = Vec::new();
+            if looks_path {
+                let p = PathBuf::from(line);
+                if p.is_dir() {
+                    chosen.push(saves::spec_from_path(&p, folder.as_deref()));
+                } else {
+                    println!("  [!] 该目录不存在，未记录");
+                }
+            } else {
+                for tok in line.split(|c: char| c == ',' || c == ' ' || c == '、') {
+                    let tok = tok.trim();
+                    if tok.is_empty() {
+                        continue;
+                    }
+                    match tok.parse::<usize>() {
+                        Ok(n) if n >= 1 && n <= res.candidates.len() => {
+                            let spec = res.candidates[n - 1].spec.clone();
+                            if !chosen.iter().any(|s| {
+                                s.root == spec.root && s.rel == spec.rel
+                            }) {
+                                chosen.push(spec);
+                            }
+                        }
+                        _ => println!("  [!] 忽略无法识别的输入：{tok}"),
+                    }
+                }
+            }
+            if !chosen.is_empty() {
+                g.save_specs = chosen;
+                println!("  [+] 已记录 {} 条路径", g.save_specs.len());
+            }
+        }
+    }
+
+    if pick {
+        lib.save(library_path)?;
+        println!("\n[*] 已写回 {}", library_path.display());
+    } else {
+        println!("\n[*] 共列出 {total} 条候选；{none} 个游戏没找到。加 --pick 可以把确认的路径写进库。");
+    }
     Ok(())
 }
 

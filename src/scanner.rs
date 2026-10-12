@@ -33,6 +33,7 @@ pub fn scan(root: &Path) -> Vec<GameEntry> {
                     rating: 0,
                     note: String::new(),
                     added_at: now.clone(),
+                    save_specs: Vec::new(),
                 });
             } else if is_exe(&path) {
                 games.push(GameEntry {
@@ -51,6 +52,7 @@ pub fn scan(root: &Path) -> Vec<GameEntry> {
                     rating: 0,
                     note: String::new(),
                     added_at: now.clone(),
+                    save_specs: Vec::new(),
                 });
             }
         }

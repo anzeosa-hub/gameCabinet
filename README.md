@@ -48,6 +48,11 @@ game-cabinet edit <游戏名> --cover <图片路径或URL>
 # 生成 HTML 海报墙
 game-cabinet wall --library library.json --out wall.html
 
+# 探测游戏的存档位置（只读：不移动、不修改任何文件）
+game-cabinet probe --library library.json            # 只列出本机真实存在的候选
+game-cabinet probe --library library.json --all      # 连还不存在的路径也列出来
+game-cabinet probe --library library.json --pick     # 交互确认，写进 library.json
+
 # 启动图形界面（默认）
 game-cabinet gui
 ```
@@ -55,6 +60,17 @@ game-cabinet gui
 ## 数据
 
 游戏库数据保存在扫描根目录的 `library.json`，封面保存在 `<根目录>/covers`。二者默认不纳入版本库（见 `.gitignore`）。
+
+### 存档位置
+
+存档是按**机器无关**的「根目录记号 + 相对路径」记存的，而不是绝对路径：
+
+```json
+"save_specs": [{ "root": "locallow", "rel": "Ludeon Studios\\RimWorld by Ludeon Studios" }]
+```
+
+`root` 取值：`locallow` / `local` / `roaming` / `documents` / `savedgames` / `home` / `programdata` / `install`。
+这样能避免把当前用户名焊死在路径里 —— 备份时按本机展开去读，还原时按新机器重新展开去写。
 
 ## 许可证
 

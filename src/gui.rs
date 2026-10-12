@@ -32,6 +32,12 @@ pub struct HeroMsg {
     pub rel: String,
 }
 
+/// 后台「探测存档位置」完成后回传的消息。`key` 是发起时用的游戏显示名
+pub struct ProbeMsg {
+    pub key: String,
+    pub result: crate::saves::ProbeResult,
+}
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// 当前主题：true=夜色（默认），false=日间。设计令牌函数都读它。
 static THEME_DARK: AtomicBool = AtomicBool::new(true);
@@ -978,6 +984,12 @@ struct CabinetApp {
     /// 英雄图懒加载：已在飞行的请求 / 试过但没有结果的 appid（避免反复重试）
     hero_rx: Option<Receiver<Option<HeroMsg>>>,
     hero_tried: std::collections::HashSet<u32>,
+    /// 存档位置探测：后台线程回传（枚举各存档富集区要读不少目录，不能卡着 UI 线程做）
+    probe_rx: Option<Receiver<ProbeMsg>>,
+    /// 探测结果缓存，key = 游戏显示名
+    saves_cache: std::collections::HashMap<String, crate::saves::ProbeResult>,
+    /// 正在探测的游戏名（用于自己去重，避免重复起线程）
+    probing: Option<String>,
     /// 封面平均色缓存（列表卡片做毛玻璃底用）
     avg: std::collections::HashMap<String, egui::Color32>,
     // 编辑缓冲
@@ -1058,6 +1070,9 @@ impl Default for CabinetApp {
             settle: 0,
             hero_rx: None,
             hero_tried: Default::default(),
+            probe_rx: None,
+            saves_cache: Default::default(),
+            probing: None,
             avg: Default::default(),
             edit_progress: 0,
             edit_rating: 0,
@@ -1239,6 +1254,9 @@ impl CabinetApp {
         self.selected = None;
         self.editing = false;
         self.textures.clear();
+        self.saves_cache.clear();
+        self.probing = None;
+        self.probe_rx = None;
         self.status = format!("已打开库：{} 款", self.games.len());
     }
 
@@ -1887,6 +1905,8 @@ impl CabinetApp {
                         ui.vertical(|ui| {
                             ui.set_max_width(nw);
                             self.notes_panel(ui, nw, &snap);
+                            ui.add_space(12.0);
+                            self.saves_panel(ui, nw, i);
                         });
                     });
                 } else {
@@ -1903,6 +1923,8 @@ impl CabinetApp {
                     );
                     ui.add_space(12.0);
                     self.notes_panel(ui, w, &snap);
+                    ui.add_space(12.0);
+                    self.saves_panel(ui, w, i);
                 }
                 ui.add_space(10.0);
             });
@@ -2044,11 +2066,11 @@ impl CabinetApp {
                     egui::TextEdit::multiline(&mut self.edit_note)
                         .desired_rows(7)
                         .desired_width(f32::INFINITY)
-                        .hint_text("存档位置、修改器、通关心得…"),
+                        .hint_text("修改器、通关心得…"),
                 );
             } else if s.note.trim().is_empty() {
                 ui.label(
-                    egui::RichText::new("（空）点顶部「编辑」可以写点东西：存档位置、修改器、通关心得。")
+                    egui::RichText::new("（空）点顶部「编辑」可以写点东西：修改器、通关心得。")
                         .color(text_sub())
                         .size(13.0),
                 );
@@ -2063,6 +2085,181 @@ impl CabinetApp {
             );
         });
     }
+
+    /// 后台探测某个游戏的存档位置。**只读**：读游戏目录找引擎指纹，再扫几个存档富集区。
+    fn start_probe(&mut self, i: usize, key: String) {
+        if self.probing.is_some() {
+            // 同一时刻只跑一个探针线程：翻 AppData 这类目录 IO 不轻，并发扫描会明显抢磁盘
+            return;
+        }
+        let Some(g) = self.games.get(i) else {
+            return;
+        };
+        let folder = g.folder.clone().map(PathBuf::from);
+        let exe = g.executable.clone().map(PathBuf::from);
+        let name = g.name.clone();
+        let (tx, rx) = mpsc::channel();
+        self.probe_rx = Some(rx);
+        self.probing = Some(key.clone());
+        std::thread::spawn(move || {
+            let result = crate::saves::probe_game(folder.as_deref(), exe.as_deref(), &name);
+            let _ = tx.send(ProbeMsg { key, result });
+        });
+    }
+
+    /// 「存档位置」面板：列出探测到的候选，勾选即确认并写进 library.json
+    fn saves_panel(&mut self, ui: &mut egui::Ui, w: f32, i: usize) {
+        let key = match self.games.get(i) {
+            Some(g) => display_name(g).to_string(),
+            None => return,
+        };
+        // 没探测过、也没在探测中就起后台线程（枚举存档富集区要读不少目录，不能卡 UI 线程）
+        if !self.saves_cache.contains_key(&key) && self.probing.as_deref() != Some(key.as_str()) {
+            self.start_probe(i, key.clone());
+        }
+        let res = self.saves_cache.get(&key).cloned();
+
+        glass_frame().show(ui, |ui| {
+            ui.set_min_width((w - 28.0).max(150.0));
+            ui.label(egui::RichText::new("存档位置").size(14.0).strong().color(text_main()));
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            let Some(r) = res else {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label(egui::RichText::new("正在本机查找…").color(text_sub()).size(13.0));
+                });
+                return;
+            };
+
+            if let Some(e) = &r.engine {
+                ui.label(egui::RichText::new(format!("引擎：{e}")).color(text_sub()).size(12.0));
+                ui.add_space(4.0);
+            }
+            if r.candidates.is_empty() {
+                ui.label(
+                    egui::RichText::new("没找到。可能还没玩过（存档目录尚未生成），或位置需要手动指定。")
+                        .color(text_sub())
+                        .size(12.5),
+                );
+            }
+
+            for c in r.candidates.iter().take(6) {
+                let spec = c.spec.clone();
+                let confirmed = self.games[i].save_specs.iter().any(|s| {
+                    s.root == spec.root && s.rel == spec.rel
+                });
+                let meta = if c.exists {
+                    format!(
+                        "{} · {} 文件 · {} · {}",
+                        crate::saves::fmt_bytes(c.bytes),
+                        c.files,
+                        crate::saves::fmt_modified(c.modified),
+                        c.origin.label(),
+                    )
+                } else {
+                    format!("本机不存在 · {}", c.origin.label())
+                };
+                ui.horizontal_top(|ui| {
+                    let mut on = confirmed;
+                    if ui.checkbox(&mut on, "").clicked() {
+                        let specs = &mut self.games[i].save_specs;
+                        match specs.iter().position(|s| s.root == spec.root && s.rel == spec.rel) {
+                            Some(p) => {
+                                specs.remove(p);
+                            }
+                            None => specs.push(spec.clone()),
+                        }
+                        let lib = crate::library::Library { games: self.games.clone() };
+                        if let Err(e) = lib.save(&self.library_path) {
+                            eprintln!("存档路径保存失败: {e}");
+                        }
+                    }
+                    ui.vertical(|ui| {
+                        let shown = shorten_path(&c.path);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(shown)
+                                    .size(13.0)
+                                    .color(if c.exists { text_main() } else { text_sub() }),
+                            )
+                            .truncate(true),
+                        )
+                        .on_hover_text(c.path.display().to_string())
+                        .on_hover_text(&c.why);
+                        ui.label(egui::RichText::new(meta).size(11.5).color(text_sub()));
+                    });
+                });
+                ui.add_space(6.0);
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("重新探测").clicked() {
+                    self.saves_cache.remove(&key);
+                    self.probing = None;
+                    self.probe_rx = None;
+                    self.start_probe(i, key.clone());
+                }
+                if ui.button("手动指定目录…").clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        let folder = self.games[i].folder.clone().map(PathBuf::from);
+                        let sp = crate::saves::spec_from_path(&dir, folder.as_deref());
+                        if !self.games[i]
+                            .save_specs
+                            .iter()
+                            .any(|s| s.root == sp.root && s.rel == sp.rel)
+                        {
+                            self.games[i].save_specs.push(sp);
+                        }
+                        let lib = crate::library::Library { games: self.games.clone() };
+                        if let Err(e) = lib.save(&self.library_path) {
+                            eprintln!("存档路径保存失败: {e}");
+                        }
+                    }
+                }
+                if ui.button("在资源管理器中打开").clicked() {
+                    let folder = self.games[i].folder.clone().map(PathBuf::from);
+                    match self.games[i]
+                        .save_specs
+                        .first()
+                        .and_then(|s| s.resolve(folder.as_deref()))
+                    {
+                        Some(p) if p.exists() => {
+                            let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                        }
+                        Some(_) => self.status = "存档目录还不存在".into(),
+                        None => self.status = "还没指定存档位置".into(),
+                    }
+                }
+            });
+        });
+    }
+}
+
+/// 把 `C:\Users\zelun\AppData\LocalLow\...` 压成 `%LOCALAPPDATA%Low\...`，短一些好读
+fn shorten_path(p: &Path) -> String {
+    use crate::saves::SaveRoot;
+    let s = p.to_string_lossy().into_owned();
+    // 顺序有讲究：LocalLow 必须在 Local 之前判，否则会先命中较短的 `%LOCALAPPDATA%`
+    for (root, tok) in [
+        (SaveRoot::LocalLow, "%LOCALAPPDATA%Low"),
+        (SaveRoot::Documents, "%USERPROFILE%\\Documents"),
+        (SaveRoot::SavedGames, "%USERPROFILE%\\Saved Games"),
+        (SaveRoot::Local, "%LOCALAPPDATA%"),
+        (SaveRoot::Roaming, "%APPDATA%"),
+        (SaveRoot::ProgramData, "%ProgramData%"),
+        (SaveRoot::Home, "%USERPROFILE%"),
+    ] {
+        if let Some(b) = root.base(None) {
+            let bs = b.to_string_lossy().into_owned();
+            if s.len() > bs.len() && s.starts_with(&bs) {
+                return s.replacen(&bs, tok, 1);
+            }
+        }
+    }
+    s
 }
 
 /// 「2026-10-08T22:58:00+08:00」→「2026-10-08」
@@ -2487,6 +2684,24 @@ impl eframe::App for CabinetApp {
         }
         self.maybe_fetch_hero(ctx);
 
+        // 接收后台「存档位置探测」结果
+        if let Some(rx) = self.probe_rx.take() {
+            match rx.try_recv() {
+                Ok(m) => {
+                    self.probing = None;
+                    self.saves_cache.insert(m.key, m.result);
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.probe_rx = Some(rx); // 还没好，放回继续等
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.probing = None;
+                }
+            }
+        }
+
         // 整窗口虚化背景。
         // 注意：egui 的 SidePanel/TopBottomPanel/CentralPanel 用的就是 LayerId::background()
         // （见 egui containers/panel.rs），即面板和这张背景图落在【同一个 PaintList】里，
@@ -2503,6 +2718,9 @@ impl eframe::App for CabinetApp {
                     self.textures.clear();
                     self.selected = None;
                     self.editing = false;
+                    self.saves_cache.clear();
+                    self.probing = None;
+                    self.probe_rx = None;
                     self.status = format!("扫描完成，共 {} 款", self.games.len());
                     // 动效：列表重新错峰入场 + 顶部亮一下「扫描完成」对勾
                     self.list_t = 0.0;

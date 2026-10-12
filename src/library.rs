@@ -68,6 +68,13 @@ pub struct GameEntry {
     pub note: String,
     /// 入库时间（RFC3339）
     pub added_at: String,
+    /// 存档位置（人工确认过的）。
+    ///
+    /// 存的是**机器无关**的「根目录记号 + 相对路径」，不是绝对路径：
+    /// 绝对路径会把当前用户名焊死在里面，换机 / 换用户名就失效。
+    /// 备份时按本机展开去读、还原时按新机器重新展开去写。
+    #[serde(default)]
+    pub save_specs: Vec<crate::saves::SaveSpec>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
